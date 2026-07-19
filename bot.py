@@ -1,0 +1,94 @@
+import os
+import re
+import pdfplumber
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# paste your actual token inside these double quotes
+TOKEN = "8947029579:AAH5iXISw-XpYlD4oh82wqufnH_f3ThGbLM"
+
+TAX_RATE = 0.32 
+
+def extract_earnings_from_pdf(pdf_path):
+    with pdfplumber.open(pdf_path) as pdf:
+        full_text = ""
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                full_text += text + "\n"
+
+    patterns = [
+        # Looks for "Your earnings" followed by an optional 'A', optional '$', and the amount
+        r"Your\s*earnings\s*A?\$?\s*([\d,]+\.\d{2})",
+        # Fallback for "Total earnings" with an optional 'A'
+        r"Total\s*earnings\s*A?\$?\s*([\d,]+\.\d{2})",
+        # Fallback for just "Total" or "Payout" with an optional 'A'
+        r"(?:Total|Payout)\s*A?\$?\s*([\d,]+\.\d{2})"
+    ]
+   
+    
+    for pattern in patterns:
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match:
+            raw_amount = match.group(1).replace(",", "")
+            return float(raw_amount)
+            
+    return None
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Welcome! Send me your weekly Uber Eats PDF statement, "
+        "and I'll calculate your tax!"
+    )
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    document = update.message.document
+    
+    if not document.file_name.lower().endswith('.pdf'):
+        await update.message.reply_text("❌ Please send your weekly statement as a PDF file.")
+        return
+        
+    await update.message.reply_text("📥 Statement received. Analyzing your earnings...")
+    
+    tg_file = await context.bot.get_file(document.file_id)
+    local_pdf_path = f"temp_{document.file_name}"
+    await tg_file.download_to_drive(local_pdf_path)
+    
+    try:
+        earnings = extract_earnings_from_pdf(local_pdf_path)
+        
+        if earnings is not None:
+            tax_to_save = earnings * TAX_RATE
+            net_take_home = earnings - tax_to_save
+            
+            response_msg = (
+                f"📊 *Weekly Tax Breakdown*\n\n"
+                f"💰 *Total Earnings parsed:* ${earnings:,.2f}\n"
+                f"🏦 *Tax Withholding (32%):* ${tax_to_save:,.2f}\n"
+                f"💵 *Your Net Take-Home:* ${net_take_home:,.2f}\n\n"
+                f"💡 _Tip: transfer ${tax_to_save:,.2f} to your tax savings account!_"
+            )
+            await update.message.reply_text(response_msg, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(
+                "⚠️ PDF read successfully, but I couldn't find a line saying 'Total earnings'. "
+                "Make sure it's an official weekly summary statement!"
+            )
+            
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error processing the PDF: {str(e)}")
+        
+    finally:
+        if os.path.exists(local_pdf_path):
+            os.remove(local_pdf_path)
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    print("Bot is running successfully... Press Ctrl+C in this terminal to stop.")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
