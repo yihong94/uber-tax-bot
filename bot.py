@@ -5,7 +5,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # paste your actual token inside these double quotes
-TOKEN = "8947029579:AAH5iXISw-XpYlD4oh82wqufnH_f3ThGbLM"
+TOKEN = TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 TAX_RATE = 0.32 
 
