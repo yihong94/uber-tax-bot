@@ -5,9 +5,10 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # paste your actual token inside these double quotes
-TOKEN = TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
-TAX_RATE = 0.32 
+TAX_RATE = 0.32
+
 
 def extract_earnings_from_pdf(pdf_path):
     with pdfplumber.open(pdf_path) as pdf:
