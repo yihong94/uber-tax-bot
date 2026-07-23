@@ -1,5 +1,6 @@
 import os
 import threading
+from PIL import Image
 from flask import Flask
 import re
 import pdfplumber
