@@ -141,18 +141,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         receipt_image = Image.open(local_photo_path)
 
         today_date = datetime.now().strftime("%d/%m/%y")
-        prompt = f"""
-            Extract only the following details from this fuel receipt image:
-            1. Vendor Name
-            2. Total Amount Paid
-            3. Date (format as DD/MM/YY. If date is not visible or missing, use today's date: {today_date})
+        prompt = (
+            "Extract only the following details from this fuel receipt image:\n"
+            "1. Vendor Name\n"
+            "2. Total Amount Paid\n"
+            f"3. Date (format as DD/MM/YY. If date is not visible or missing, use today's date: {today_date})\n\n"
+            'Format your response strictly as JSON with key names: "vendor", "total", "date".\n'
+            "Do not include markdown formatting or backticks around the JSON.\n"
+            "Example format:\n"
+            f'{{"vendor": "EG Cannonvale", "total": "48.30", "date": "{today_date}"}}'
+        )
 
-            Format your response strictly as JSON with key names: "vendor", "total", "date".
-            Do not include markdown formatting or backticks around the JSON.
-            Example format:
-            {{{"vendor": "BP Proserpine", "total": "38.95", "date": "{today_date}"}}}
-
-            """
 
 
 
