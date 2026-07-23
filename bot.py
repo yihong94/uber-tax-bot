@@ -71,14 +71,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Open image with Pillow for Gemini SDK
         receipt_image = Image.open(local_photo_path)
 
-        prompt = (
-            "Analyze this fuel receipt image and extract the following details:\n"
-            "- Total Amount Paid ($)\n"
-            "- Date\n"
-            "- Fuel Type (e.g., Diesel, Unleaded 91)\n"
-            "- Litres Purchased\n\n"
-            "Format the output as a clear summary."
-        )
+        prompt = """
+            Extract only the following details from this fuel receipt image:
+            1. Vendor Name
+            2. Total Amount Paid
+            3. Date (If not visible or missing, use today's date: {today_date})
+
+            Format your response EXACTLY as follows, with no extra intro, outro, or explanation:
+
+            Vendor: [Vendor Name]
+            Total: $[Total Amount]
+            Date: [DD/MM/YYYY]
+                    """
+
 
         # Call Gemini Vision model
         client = genai.Client()
