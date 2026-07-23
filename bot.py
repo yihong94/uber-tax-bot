@@ -3,6 +3,7 @@ import json
 import io
 import re
 import threading
+import tempfile
 from datetime import datetime
 
 # Third-party packages
@@ -131,7 +132,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]  # Get highest resolution
     photo_file = await photo.get_file()
     
-    local_photo_path = f"temp_{photo.file_id}.jpg"
+    local_photo_path = os.path.join(tempfile.gettempdir(), f"temp_{photo.file_id}.jpg")
+
     
     try:
         await photo_file.download_to_drive(local_photo_path)
