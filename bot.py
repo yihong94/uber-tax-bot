@@ -155,23 +155,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-        # Call Gemini Vision model
+        # Call Gemini Vision model with retry logic
         client = genai.Client()
         max_retries = 3
+        
         for attempt in range(max_retries):
             try:
                 response = client.models.generate_content(
                     model=model,
                     contents=[receipt_image, prompt]
                 )
-                break
+                break  # Call succeeded, exit loop
             except Exception as e:
-                if "503" in str(e) and attempt < max_retries - 1:
+                if attempt < max_retries - 1:
                     import time
-                    time.sleep(2)
-                    continue
+                    time.sleep(3)  # Wait 3 seconds before retrying
                 else:
-                    raise e
+                    raise e  # If all retries fail, raise error
 
 
 
