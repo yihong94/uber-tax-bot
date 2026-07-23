@@ -214,7 +214,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     except Exception as e:
-        await update.message.reply_text(f"Error reading receipt: {str(e)}")
+        err_msg = str(e) or repr(e) or type(e).__name__
+        await update.message.reply_text(f"Error reading receipt: {err_msg}")
+
         
     finally:
         if os.path.exists(local_photo_path):
