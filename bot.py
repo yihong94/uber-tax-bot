@@ -140,28 +140,78 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Open image with Pillow for Gemini SDK
         receipt_image = Image.open(local_photo_path)
 
-        prompt = """
+        today_date = datetime.now().strftime("%d/%m/%y")
+        prompt = f"""
             Extract only the following details from this fuel receipt image:
             1. Vendor Name
             2. Total Amount Paid
-            3. Date (If not visible or missing, use today's date: {today_date})
+            3. Date (format as DD/MM/YY. If date is not visible or missing, use today's date: {today_date})
 
-            Format your response EXACTLY as follows, with no extra intro, outro, or explanation:
+            Format your response strictly as JSON with key names: "vendor", "total", "date".
+            Do not include markdown formatting or backticks around the JSON.
+            Example format:
+            {{{"vendor": "BP Proserpine", "total": "38.95", "date": "{today_date}"}}}
 
-            Vendor: [Vendor Name]
-            Total: $[Total Amount]
-            Date: [DD/MM/YYYY]
-                    """
+            """
+
 
 
         # Call Gemini Vision model
-        client = genai.Client()
-        response = client.models.generate_content(
-            model=model,
-            contents=[receipt_image, prompt]
-)
+                # Try up to 3 times if Google hits a temporary 503 spike
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[receipt_image, prompt]
+                )
+                break
+            except Exception as e:
+                if "503" in str(e) and attempt < max_retries - 1:
+                    import time
+                    time.sleep(2)
+                    continue
+                else:
+                    raise e
 
-        await update.message.reply_text(response.text)
+
+                # Parse JSON output from Gemini
+        raw_text = response.text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(raw_text)
+        
+        vendor_val = str(data.get("vendor", "Unknown Vendor")).strip()
+        total_val = str(data.get("total", "0.00")).replace("$", "").strip()
+        date_val = str(data.get("date", today_date)).strip()
+
+        # Check for duplicates in Google Sheets
+        if is_duplicate_receipt(date_val, vendor_val, total_val):
+            msg = (
+                f"**Vendor:** {vendor_val}\n"
+                f"**Total:** ${total_val}\n"
+                f"**Date:** {date_val}\n\n"
+                f"⚠️ *Duplicate detected — skipped Google Drive & Sheet update.*"
+            )
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        # Upload image bytes to Google Drive
+        with open(local_photo_path, "rb") as f:
+            file_bytes = f.read()
+        
+        file_name = f"{date_val} fuel receipt.jpg".replace("/", "-")
+        drive_link = upload_receipt_to_drive(file_bytes, file_name)
+
+        # Log receipt in Google Sheet
+        append_to_sheet(date_val, vendor_val, total_val, drive_link)
+
+        # Send clean response back to Telegram user
+        clean_msg = (
+            f"**Vendor:** {vendor_val}\n"
+            f"**Total:** ${total_val}\n"
+            f"**Date:** {date_val}"
+        )
+        await update.message.reply_text(clean_msg, parse_mode="Markdown")
+
 
     except Exception as e:
         await update.message.reply_text(f"Error reading receipt: {str(e)}")
