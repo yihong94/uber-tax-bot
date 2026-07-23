@@ -156,7 +156,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
         # Call Gemini Vision model
-                # Try up to 3 times if Google hits a temporary 503 spike
+        client = genai.Client()
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -172,6 +172,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
                 else:
                     raise e
+
 
 
                 # Parse JSON output from Gemini
