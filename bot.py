@@ -58,7 +58,7 @@ def extract_earnings_from_pdf(pdf_path):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Downloads fuel receipt photos and extracts details using Gemini API."""
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    model = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
     photo = update.message.photo[-1]  # Get highest resolution
     photo_file = await photo.get_file()
     
