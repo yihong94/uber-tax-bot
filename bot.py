@@ -1,12 +1,24 @@
 import os
+import json
+import io
+import re
 import threading
+from datetime import datetime
+
+# Third-party packages
+import gspread
+import pdfplumber
 from PIL import Image
 from flask import Flask
-import re
-import pdfplumber
 from google import genai
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+
+# Telegram bot framework
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
 
 # Initialize Gemini Client (uses GEMINI_API_KEY environment variable)
 ai_client = genai.Client()
@@ -29,6 +41,63 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 TAX_RATE = 0.32
 
+# --- GOOGLE SERVICES HELPERS ---
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+def get_google_credentials():
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if not creds_json:
+        raise ValueError("GOOGLE_CREDENTIALS_JSON environment variable not set.")
+    creds_dict = json.loads(creds_json)
+    return Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+
+def is_duplicate_receipt(date_str, vendor_str, total_str):
+    creds = get_google_credentials()
+    gc = gspread.authorize(creds)
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
+    sh = gc.open_by_key(sheet_id).sheet1
+    
+    records = sh.get_all_records()
+    total_clean = total_str.replace("$", "").strip()
+    
+    for row in records:
+        row_date = str(row.get("Date", "")).strip()
+        row_vendor = str(row.get("Vendor", "")).strip().lower()
+        row_total = str(row.get("Total", "")).replace("$", "").strip()
+        
+        if row_date == date_str and row_vendor == vendor_str.lower() and row_total == total_clean:
+            return True
+    return False
+
+def append_to_sheet(date_str, vendor_str, total_str, drive_link=""):
+    creds = get_google_credentials()
+    gc = gspread.authorize(creds)
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
+    sh = gc.open_by_key(sheet_id).sheet1
+    
+    sh.append_row([date_str, vendor_str, f"${total_str.replace('$', '').strip()}", drive_link])
+
+def upload_receipt_to_drive(file_bytes, file_name):
+    creds = get_google_credentials()
+    drive_service = build('drive', 'v3', credentials=creds)
+    folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+    
+    file_metadata = {
+        'name': file_name,
+        'parents': [folder_id] if folder_id else []
+    }
+    
+    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype='image/jpeg')
+    uploaded_file = drive_service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields='id, webViewLink'
+    ).execute()
+    
+    return uploaded_file.get('webViewLink')
 
 def extract_earnings_from_pdf(pdf_path):
     with pdfplumber.open(pdf_path) as pdf:
