@@ -3,9 +3,12 @@ import threading
 from flask import Flask
 import re
 import pdfplumber
+from google import genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+# Initialize Gemini Client (uses GEMINI_API_KEY environment variable)
+ai_client = genai.Client()
 # 1. Initialize Flask app
 web_app = Flask(__name__)
 
@@ -51,6 +54,44 @@ def extract_earnings_from_pdf(pdf_path):
             return float(raw_amount)
             
     return None
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Downloads fuel receipt photos and extracts details using Gemini API."""
+    photo = update.message.photo[-1]  # Get highest resolution
+    photo_file = await photo.get_file()
+    
+    local_photo_path = f"temp_{photo.file_id}.jpg"
+    
+    try:
+        await photo_file.download_to_drive(local_photo_path)
+        await update.message.reply_text("Analyzing fuel receipt with Gemini...")
+
+        # Open image with Pillow for Gemini SDK
+        receipt_image = Image.open(local_photo_path)
+
+        prompt = (
+            "Analyze this fuel receipt image and extract the following details:\n"
+            "- Total Amount Paid ($)\n"
+            "- Date\n"
+            "- Fuel Type (e.g., Diesel, Unleaded 91)\n"
+            "- Litres Purchased\n\n"
+            "Format the output as a clear summary."
+        )
+
+        # Call Gemini Vision model
+        response = ai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[receipt_image, prompt]
+        )
+
+        await update.message.reply_text(response.text)
+
+    except Exception as e:
+        await update.message.reply_text(f"Error reading receipt: {str(e)}")
+        
+    finally:
+        if os.path.exists(local_photo_path):
+            os.remove(local_photo_path)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -108,6 +149,8 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    # Add photo handler for receipts
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     print("Bot is running successfully... Press Ctrl+C in this terminal to stop.")
     app.run_polling()
