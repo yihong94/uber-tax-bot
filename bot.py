@@ -1,8 +1,24 @@
 import os
+import threading
+from flask import Flask
 import re
 import pdfplumber
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# 1. Initialize Flask app
+web_app = Flask(__name__)
+
+@web_app.route('/')
+@web_app.route('/health')
+def health_check():
+    # Returns a 200 OK status to cron-job.org
+    return "Bot is alive!", 200
+
+def run_web_server():
+    # Render automatically sets the PORT environment variable
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host="0.0.0.0", port=port)
 
 # paste your actual token inside these double quotes
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -84,12 +100,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(local_pdf_path)
 
 def main():
+    # Start web server in background thread for cron-job pinging
+    server_thread = threading.Thread(target=run_web_server, daemon=True)
+    server_thread.start()
+    print("Health check web server started.")
+
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    
+
     print("Bot is running successfully... Press Ctrl+C in this terminal to stop.")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+
