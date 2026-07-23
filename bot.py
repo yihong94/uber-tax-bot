@@ -58,6 +58,7 @@ def extract_earnings_from_pdf(pdf_path):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Downloads fuel receipt photos and extracts details using Gemini API."""
+    model = os.environ.get("GEMINI_MODEL", "gemini-flash")
     photo = update.message.photo[-1]  # Get highest resolution
     photo_file = await photo.get_file()
     
@@ -80,10 +81,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         # Call Gemini Vision model
-        response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+        client = genai.Client()
+        response = client.models.generate_content(
+            model=model,
             contents=[receipt_image, prompt]
-        )
+)
 
         await update.message.reply_text(response.text)
 
