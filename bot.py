@@ -132,15 +132,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]  # Get highest resolution
     photo_file = await photo.get_file()
     
-    local_photo_path = os.path.join(tempfile.gettempdir(), f"temp_{photo.file_id}.jpg")
-
-    
     try:
-        await photo_file.download_to_drive(local_photo_path)
+        # Download directly to RAM to avoid permission issues
+        photo_bytes = await photo_file.download_as_bytearray()
+        receipt_image = Image.open(io.BytesIO(photo_bytes))
+
         await update.message.reply_text("Analyzing fuel receipt with Gemini...")
 
-        # Open image with Pillow for Gemini SDK
-        receipt_image = Image.open(local_photo_path)
 
         today_date = datetime.now().strftime("%d/%m/%y")
         prompt = (
@@ -191,17 +189,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"**Vendor:** {vendor_val}\n"
                 f"**Total:** ${total_val}\n"
                 f"**Date:** {date_val}\n\n"
-                f"⚠️ *Duplicate detected — skipped Google Drive & Sheet update.*"
+                f"⚠️ *Duplicate detected - skipped Google Drive & Sheet update*"
+
             )
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
-
-        # Upload image bytes to Google Drive
-        with open(local_photo_path, "rb") as f:
-            file_bytes = f.read()
         
         file_name = f"{date_val} fuel receipt.jpg".replace("/", "-")
-        drive_link = upload_receipt_to_drive(file_bytes, file_name)
+        drive_link = upload_receipt_to_drive(photo_bytes, file_name)
 
         # Log receipt in Google Sheet
         append_to_sheet(date_val, vendor_val, total_val, drive_link)
@@ -219,10 +214,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         err_msg = str(e) or repr(e) or type(e).__name__
         await update.message.reply_text(f"Error reading receipt: {err_msg}")
 
-        
-    finally:
-        if os.path.exists(local_photo_path):
-            os.remove(local_photo_path)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
