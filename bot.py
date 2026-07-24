@@ -134,10 +134,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_file = await photo.get_file()
 
     try:
-        # Download directly into memory buffer
-        photo_bytes = await photo_file.download_as_bytearray()
-        
-        # Prepare image for google.genai SDK safely in RAM
+        # Fetch file bytes directly into RAM
+        import urllib.request
+        req = urllib.request.Request(photo_file.file_path, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as resp:
+            photo_bytes = resp.read()
+
+        # Prepare image for google.genai SDK
         receipt_image = types.Part.from_bytes(
             data=photo_bytes,
             mime_type="image/jpeg"
@@ -157,7 +160,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'{{"vendor": "EG Cannonvale", "total": "48.30", "date": "{today_date}"}}'
         )
 
-        # Call Gemini Vision model with retry logic
         client = genai.Client()
         max_retries = 3
         response = None
@@ -168,7 +170,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     model=model,
                     contents=[receipt_image, prompt]
                 )
-                break  # Call succeeded, exit loop
+                break
             except Exception as e:
                 if attempt < max_retries - 1:
                     import time
@@ -176,7 +178,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     raise e
 
-        # Parse JSON output from Gemini (outside retry loop)
+        # Parse JSON output from Gemini
         raw_text = response.text.replace("```json", "").replace("```", "").strip()
         data = json.loads(raw_text)
 
@@ -212,6 +214,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         err_msg = str(e) or repr(e) or type(e).__name__
         await update.message.reply_text(f"Error reading receipt: {err_msg}")
+
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
