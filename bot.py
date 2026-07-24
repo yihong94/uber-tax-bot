@@ -12,6 +12,7 @@ import pdfplumber
 from PIL import Image
 from flask import Flask
 from google import genai
+from google.genai import types
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -133,9 +134,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_file = await photo.get_file()
 
     try:
-        # Download directly to RAM to avoid permission issues
+        # Download directly into memory buffer
         photo_bytes = await photo_file.download_as_bytearray()
-        receipt_image = Image.open(io.BytesIO(photo_bytes))
+        
+        # Prepare image for google.genai SDK safely in RAM
+        receipt_image = types.Part.from_bytes(
+            data=photo_bytes,
+            mime_type="image/jpeg"
+        )
 
         await update.message.reply_text("Analyzing fuel receipt with Gemini...")
 
@@ -162,15 +168,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     model=model,
                     contents=[receipt_image, prompt]
                 )
-                break  # Call succeeded, exit retry loop
+                break  # Call succeeded, exit loop
             except Exception as e:
                 if attempt < max_retries - 1:
                     import time
-                    time.sleep(3)  # Wait 3 seconds before retrying
+                    time.sleep(3)
                 else:
-                    raise e  # If all retries fail, raise error
+                    raise e
 
-        # Parse JSON output from Gemini (out of retry loop, inside main try)
+        # Parse JSON output from Gemini (outside retry loop)
         raw_text = response.text.replace("```json", "").replace("```", "").strip()
         data = json.loads(raw_text)
 
@@ -206,7 +212,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         err_msg = str(e) or repr(e) or type(e).__name__
         await update.message.reply_text(f"Error reading receipt: {err_msg}")
-
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
