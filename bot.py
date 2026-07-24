@@ -131,14 +131,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
     photo = update.message.photo[-1]  # Get highest resolution
     photo_file = await photo.get_file()
-    
+
     try:
         # Download directly to RAM to avoid permission issues
         photo_bytes = await photo_file.download_as_bytearray()
         receipt_image = Image.open(io.BytesIO(photo_bytes))
 
         await update.message.reply_text("Analyzing fuel receipt with Gemini...")
-
 
         today_date = datetime.now().strftime("%d/%m/%y")
         prompt = (
@@ -152,20 +151,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'{{"vendor": "EG Cannonvale", "total": "48.30", "date": "{today_date}"}}'
         )
 
-
-
-
         # Call Gemini Vision model with retry logic
         client = genai.Client()
         max_retries = 3
-        
+        response = None
+
         for attempt in range(max_retries):
             try:
                 response = client.models.generate_content(
                     model=model,
                     contents=[receipt_image, prompt]
                 )
-                break  # Call succeeded, exit loop
+                break  # Call succeeded, exit retry loop
             except Exception as e:
                 if attempt < max_retries - 1:
                     import time
@@ -173,12 +170,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     raise e  # If all retries fail, raise error
 
-
-
-                # Parse JSON output from Gemini
+        # Parse JSON output from Gemini (out of retry loop, inside main try)
         raw_text = response.text.replace("```json", "").replace("```", "").strip()
         data = json.loads(raw_text)
-        
+
         vendor_val = str(data.get("vendor", "Unknown Vendor")).strip()
         total_val = str(data.get("total", "0.00")).replace("$", "").strip()
         date_val = str(data.get("date", today_date)).strip()
@@ -190,11 +185,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"**Total:** ${total_val}\n"
                 f"**Date:** {date_val}\n\n"
                 f"⚠️ *Duplicate detected - skipped Google Drive & Sheet update*"
-
             )
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
-        
+
         file_name = f"{date_val} fuel receipt.jpg".replace("/", "-")
         drive_link = upload_receipt_to_drive(photo_bytes, file_name)
 
@@ -209,10 +203,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(clean_msg, parse_mode="Markdown")
 
-
     except Exception as e:
         err_msg = str(e) or repr(e) or type(e).__name__
         await update.message.reply_text(f"Error reading receipt: {err_msg}")
+
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
