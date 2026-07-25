@@ -1,6 +1,7 @@
 import os
 import io
 import logging
+from datetime import datetime
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
@@ -43,25 +44,27 @@ logging.basicConfig(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Hi! Send me a photo of a fuel or purchase receipt, and I'll analyze it for you."
+        "👋 Hi! Send me a photo of a receipt, and I'll analyze it for you."
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_message = await update.message.reply_text("🔍 Analyzing receipt with Gemini...")
+    status_message = await update.message.reply_text("🔍 Analyzing receipt...")
 
     try:
+        # Get current date as default
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         image = Image.open(io.BytesIO(photo_bytes))
 
+        # Strict & Clean Extraction Prompt
         prompt = (
-            "Analyze this fuel/purchase receipt and extract the following details concisely:\n"
-            "- Merchant / Store Name\n"
-            "- Date and Time\n"
-            "- Fuel Type & Volume (if applicable)\n"
-            "- Total Amount Paid\n"
-            "- Payment Method\n"
-            "Format the output cleanly for a chat message."
+            "Analyze this receipt image and return ONLY the following three fields formatted exactly like this:\n\n"
+            "**Merchant:** [Store/Merchant Name]\n"
+            "**Date:** [Date found on receipt in YYYY-MM-DD format, or " + today_str + " if not visible/found]\n"
+            "**Total Paid:** [Total Amount with currency symbol]\n\n"
+            "Do not include any extra text, intro, or explanation."
         )
 
         response = model.generate_content([prompt, image])
