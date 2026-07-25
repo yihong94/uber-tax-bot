@@ -30,16 +30,16 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 # --- TURSO HTTP API HELPER ---
 def execute_turso_sql(sql: str, args: list = None):
-    """Executes SQL statements via Turso HTTP Pipeline API using indexed positional args."""
+    """Executes SQL statements via Turso HTTP Pipeline API using indexed positional args and correct types."""
     if args is None:
         args = []
 
     formatted_args = []
     for arg in args:
         if isinstance(arg, float):
-            formatted_args.append({"type": "float", "value": arg})  # <-- Native float number
+            formatted_args.append({"type": "float", "value": arg})
         elif isinstance(arg, int):
-            formatted_args.append({"type": "integer", "value": arg}) # <-- Native integer number
+            formatted_args.append({"type": "integer", "value": arg})
         elif arg is None:
             formatted_args.append({"type": "null"})
         else:
@@ -100,8 +100,7 @@ def init_db():
 init_db()
 
 def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
-    """Checks cloud database for matching date & amount, and flexible merchant matching."""
-    # Clean merchant name to get the core brand (e.g. 'EG Fuelco')
+    """Checks cloud database for matching date & amount with flexible merchant matching."""
     core_merchant = merchant.split('(')[0].strip().lower()
     
     # Fetch receipts on the exact same date with the exact same amount
@@ -111,14 +110,12 @@ def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
     if not rows:
         return False
         
-    # Check if any existing merchant name matches or overlaps
     for (existing_merchant,) in rows:
         existing_clean = existing_merchant.split('(')[0].strip().lower()
         if core_merchant in existing_clean or existing_clean in core_merchant:
             return True
             
     return False
-
 
 def save_receipt_to_db(merchant: str, date_str: str, amount: float):
     sql = "INSERT INTO receipts (merchant, date, amount) VALUES (?1, ?2, ?3)"
@@ -147,12 +144,51 @@ def run_http_server():
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-# --- TELEGRAM HANDLERS ---
+# --- TELEGRAM COMMAND HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Hi! Upload a receipt photo to save it, a PDF weekly summary to calculate tax, or ask questions like 'How much did I spend on fuel this month?'"
+        "👋 Hi Justin! Upload a receipt photo to save it, a PDF weekly summary to calculate tax, or ask questions like 'How much did I spend on fuel this month?'\n\n"
+        "Commands:\n"
+        "• /undo - Remove the last uploaded receipt\n"
+        "• /cleardb - Delete all receipts and start fresh"
     )
 
+async def undo_last_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes the single most recently added receipt entry."""
+    status_message = await update.message.reply_text("⏳ Removing last uploaded receipt...")
+    try:
+        latest = execute_turso_sql("SELECT id, merchant, date, amount FROM receipts ORDER BY id DESC LIMIT 1;")
+        
+        if not latest:
+            await status_message.edit_text("ℹ️ Your database is currently empty. Nothing to undo.")
+            return
+
+        receipt_id, merchant, date_str, amount = latest[0]
+        execute_turso_sql("DELETE FROM receipts WHERE id = ?1;", [receipt_id])
+
+        reply = (
+            "🗑️ **Last Receipt Removed!**\n\n"
+            f"**Merchant:** {merchant}\n"
+            f"**Date:** {date_str}\n"
+            f"**Amount:** ${float(amount):.2f}"
+        )
+        await status_message.edit_text(reply, parse_mode="Markdown")
+
+    except Exception as e:
+        logging.error(f"Undo error: {e}")
+        await status_message.edit_text(f"❌ Failed to remove last receipt: {str(e)}")
+
+async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes all receipt records from the cloud database."""
+    status_message = await update.message.reply_text("🧹 Clearing database...")
+    try:
+        execute_turso_sql("DELETE FROM receipts;")
+        await status_message.edit_text("🗑️ **Database cleared successfully!** All receipt records have been removed.", parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Clear DB error: {e}")
+        await status_message.edit_text(f"❌ Failed to clear database: {str(e)}")
+
+# --- TELEGRAM MESSAGE HANDLERS ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_message = await update.message.reply_text("🔍 Analyzing receipt...")
 
@@ -278,12 +314,17 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
+    # Commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("undo", undo_last_command))
+    app.add_handler(CommandHandler("cleardb", clear_db_command))
+
+    # Message handlers
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_query))
 
-    print("🤖 Bot is live using Turso Pure HTTP API!")
+    print("🤖 Bot is live with /undo and /cleardb functionality!")
     app.run_polling()
 
 if __name__ == "__main__":
