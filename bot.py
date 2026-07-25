@@ -11,76 +11,69 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
 from PIL import Image
-import libsql_experimental as libsql
+import libsql_client
 
-# Load Environment Variables
+# --- ENVIRONMENT & CONFIGURATION ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TURSO_URL = os.getenv("TURSO_DATABASE_URL")
 TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
-# Configure Gemini 3.5
+# Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-3.5-flash')
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # --- TURSO CLOUD DATABASE SETUP ---
-def get_db_connection():
-    """Connects to free Turso cloud SQLite database."""
-    return libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+def get_db_client():
+    """Creates a synchronous client for Turso Cloud using HTTPS (no Rust compilation required)."""
+    return libsql_client.create_client_sync(
+        url=TURSO_URL,
+        auth_token=TURSO_TOKEN
+    )
 
 def init_db():
-    conn = get_db_connection()
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS receipts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            merchant TEXT,
-            date TEXT,
-            amount REAL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    """Initializes the database schema if it doesn't already exist."""
+    with get_db_client() as client:
+        client.execute('''
+            CREATE TABLE IF NOT EXISTS receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                merchant TEXT,
+                date TEXT,
+                amount REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
 
-# Initialize Table on Startup
 init_db()
 
 def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
     """Checks cloud database for exact merchant, date, and amount match."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id FROM receipts WHERE LOWER(merchant) = LOWER(?) AND date = ? AND amount = ?",
-        (merchant, date_str, amount)
-    )
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
+    with get_db_client() as client:
+        result = client.execute(
+            "SELECT id FROM receipts WHERE LOWER(merchant) = LOWER(?) AND date = ? AND amount = ?",
+            [merchant, date_str, amount]
+        )
+        return len(result.rows) > 0
 
 def save_receipt_to_db(merchant: str, date_str: str, amount: float):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO receipts (merchant, date, amount) VALUES (?, ?, ?)",
-        (merchant, date_str, amount)
-    )
-    conn.commit()
-    conn.close()
+    """Inserts a new receipt entry into the cloud database."""
+    with get_db_client() as client:
+        client.execute(
+            "INSERT INTO receipts (merchant, date, amount) VALUES (?, ?, ?)",
+            [merchant, date_str, amount]
+        )
 
 def query_db(sql_query: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(sql_query)
-        results = cursor.fetchall()
-        conn.close()
-        return results
-    except Exception as e:
-        conn.close()
-        return f"Database query error: {e}"
+    """Executes a generated SQL query and converts rows into tuples."""
+    with get_db_client() as client:
+        try:
+            result = client.execute(sql_query)
+            return [tuple(row) for row in result.rows]
+        except Exception as e:
+            return f"Database query error: {e}"
 
 # --- HEALTH CHECK SERVER FOR RENDER / CRON-JOB ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -102,7 +95,7 @@ def run_http_server():
 # --- TELEGRAM HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Hi! Send me a photo of a receipt, an Uber weekly summary PDF, or ask questions about your fuel spending!"
+        "👋 Hi! Upload a receipt photo to save it, a PDF weekly summary to calculate tax, or ask questions like 'How much did I spend on fuel this week?'"
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -114,7 +107,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_bytes = await photo_file.download_as_bytearray()
         image = Image.open(io.BytesIO(photo_bytes))
 
-        # Prompt Gemini 3.5 for structured extraction
+        # Prompt Gemini 3.5 Flash for structured extraction
         prompt = f"""
         Analyze this image. 
         Step 1: Check if it is a purchase receipt/invoice.
@@ -136,9 +129,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = data.get("date", today_str)
         amount = float(data.get("amount", 0.0))
 
-        # Check Turso Cloud DB for duplicate entry
+        # Multi-field business key duplicate check (Merchant + Date + Amount)
         if is_duplicate_receipt(merchant, date_str, amount):
-            header = "⚠️ **Duplicate Receipt Detected!** (Exact match found in cloud DB)\n\n"
+            header = "⚠️ **Duplicate Receipt Detected!** (Exact match found in Turso Cloud DB)\n\n"
         else:
             save_receipt_to_db(merchant, date_str, amount)
             header = "✅ **Receipt Saved to Cloud Database!**\n\n"
@@ -237,7 +230,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_query))
 
-    print("🤖 Bot is live connected to free Turso Cloud SQLite database!")
+    print("🤖 Bot is live connected to free Turso Cloud SQLite database via HTTP!")
     app.run_polling()
 
 if __name__ == "__main__":
