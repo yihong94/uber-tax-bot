@@ -100,9 +100,25 @@ def init_db():
 init_db()
 
 def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
-    sql = "SELECT id FROM receipts WHERE LOWER(merchant) = LOWER(?1) AND date = ?2 AND amount = ?3"
-    rows = execute_turso_sql(sql, [merchant, date_str, amount])
-    return len(rows) > 0
+    """Checks cloud database for matching date & amount, and flexible merchant matching."""
+    # Clean merchant name to get the core brand (e.g. 'EG Fuelco')
+    core_merchant = merchant.split('(')[0].strip().lower()
+    
+    # Fetch receipts on the exact same date with the exact same amount
+    sql = "SELECT merchant FROM receipts WHERE date = ?1 AND amount = ?2"
+    rows = execute_turso_sql(sql, [date_str, amount])
+    
+    if not rows:
+        return False
+        
+    # Check if any existing merchant name matches or overlaps
+    for (existing_merchant,) in rows:
+        existing_clean = existing_merchant.split('(')[0].strip().lower()
+        if core_merchant in existing_clean or existing_clean in core_merchant:
+            return True
+            
+    return False
+
 
 def save_receipt_to_db(merchant: str, date_str: str, amount: float):
     sql = "INSERT INTO receipts (merchant, date, amount) VALUES (?1, ?2, ?3)"
