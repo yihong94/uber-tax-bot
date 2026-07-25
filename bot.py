@@ -47,18 +47,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Hi! Send me a photo of a fuel receipt or upload your Uber weekly summary PDF."
     )
 
-# Handler for Receipt Images
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_message = await update.message.reply_text("🔍 Analyzing receipt...")
+    status_message = await update.message.reply_text("🔍 Analyzing image...")
 
     try:
         today_str = datetime.now().strftime("%Y-%m-%d")
+
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         image = Image.open(io.BytesIO(photo_bytes))
 
+        # Smart prompt with non-receipt validation built-in
         prompt = (
-            "Analyze this receipt image and return ONLY the following three fields formatted exactly like this:\n\n"
+            "Analyze this image carefully.\n"
+            "Step 1: Check if this image is a purchase receipt, invoice, or docket.\n"
+            "Step 2: If it is NOT a receipt/invoice, reply ONLY with: '⚠️ This photo does not appear to be a receipt. Please upload a clear image of a receipt.'\n"
+            "Step 3: If it IS a receipt, extract the following 3 fields formatted EXACTLY like this:\n\n"
             "**Merchant:** [Store/Merchant Name]\n"
             "**Date:** [Date found on receipt in YYYY-MM-DD format, or " + today_str + " if not visible/found]\n"
             "**Total Paid:** [Total Amount with currency symbol]\n\n"
@@ -70,13 +74,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"Error processing receipt: {e}")
-        await status_message.edit_text(f"❌ Failed to process receipt: {str(e)}")
+        await status_message.edit_text(f"❌ Failed to process image: {str(e)}")
 
-# Handler for Uber Summary PDFs
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
 
-    # Ensure the uploaded file is a PDF
     if not document.file_name.endswith('.pdf'):
         await update.message.reply_text("⚠️ Please upload a valid PDF file.")
         return
@@ -87,7 +89,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdf_file = await document.get_file()
         pdf_bytes = await pdf_file.download_as_bytearray()
 
-        # Prepare PDF payload for Gemini
         pdf_part = {
             "mime_type": "application/pdf",
             "data": bytes(pdf_bytes)
@@ -112,7 +113,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_message.edit_text(f"❌ Failed to process PDF: {str(e)}")
 
 def main():
-    # Start health check server in background thread
     Thread(target=run_http_server, daemon=True).start()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
