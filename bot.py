@@ -181,7 +181,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"Receipt error: {e}")
-        await status_message.edit_text("❌ Failed to process or parse the receipt.")
+        await status_message.edit_text(f"❌ Error: {str(e)}")
+
 
 async def handle_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_query = update.message.text
