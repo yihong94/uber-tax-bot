@@ -1,19 +1,38 @@
 import os
 import io
 import logging
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
 from PIL import Image
 
-# Load environment variables
+# HTTP Server with Health Check Endpoint for cron-job.org
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health" or self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status": "ok", "bot": "running"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def run_http_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# Load Environment Variables
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Configure Gemini AI
+# Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
@@ -31,14 +50,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_message = await update.message.reply_text("🔍 Analyzing receipt with Gemini...")
 
     try:
-        # Get the highest resolution photo sent
         photo_file = await update.message.photo[-1].get_file()
-        
-        # Download photo directly into memory (BytesIO)
         photo_bytes = await photo_file.download_as_bytearray()
         image = Image.open(io.BytesIO(photo_bytes))
 
-        # Prompt for Gemini extraction
         prompt = (
             "Analyze this fuel/purchase receipt and extract the following details concisely:\n"
             "- Merchant / Store Name\n"
@@ -49,10 +64,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Format the output cleanly for a chat message."
         )
 
-        # Call Gemini Vision Model
         response = model.generate_content([prompt, image])
-
-        # Reply back to Telegram
         await status_message.edit_text(response.text)
 
     except Exception as e:
@@ -60,8 +72,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_message.edit_text(f"❌ Failed to process receipt: {str(e)}")
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    # Start health check server in background thread
+    Thread(target=run_http_server, daemon=True).start()
 
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
