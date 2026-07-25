@@ -3,6 +3,7 @@ import io
 import re
 import json
 import logging
+import requests
 from datetime import datetime
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -11,13 +12,14 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
 from PIL import Image
-import libsql_client
 
 # --- ENVIRONMENT & CONFIGURATION ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-TURSO_URL = os.getenv("TURSO_DATABASE_URL")
+
+# Ensure URL starts with https:// for Turso HTTP API
+TURSO_URL = os.getenv("TURSO_DATABASE_URL", "").replace("libsql://", "https://")
 TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
 # Configure Gemini
@@ -26,54 +28,89 @@ model = genai.GenerativeModel('gemini-3.5-flash')
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- TURSO CLOUD DATABASE SETUP ---
-def get_db_client():
-    """Creates a synchronous client for Turso Cloud using HTTPS (no Rust compilation required)."""
-    return libsql_client.create_client_sync(
-        url=TURSO_URL,
-        auth_token=TURSO_TOKEN
-    )
+# --- TURSO HTTP API HELPER ---
+def execute_turso_sql(sql: str, args: list = None):
+    """Executes SQL statements via Turso HTTP Pipeline API (Pure Python, zero C/Rust dependencies)."""
+    if args is None:
+        args = []
 
+    # Convert args into Turso API format
+    formatted_args = []
+    for arg in args:
+        if isinstance(arg, (int, float)):
+            formatted_args.append({"type": "float" if isinstance(arg, float) else "integer", "value": str(arg)})
+        elif arg is None:
+            formatted_args.append({"type": "null"})
+        else:
+            formatted_args.append({"type": "text", "value": str(arg)})
+
+    payload = {
+        "requests": [
+            {
+                "type": "execute",
+                "stmt": {
+                    "sql": sql,
+                    "args": formatted_args
+                }
+            },
+            {"type": "close"}
+        ]
+    }
+
+    headers = {
+        "Authorization": f"Bearer {TURSO_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.post(f"{TURSO_URL}/v2/pipeline", json=payload, headers=headers)
+    response.raise_for_status()
+    data = response.json()
+
+    # Extract results
+    results = data["results"][0]
+    if results["type"] == "error":
+        raise Exception(results["error"]["message"])
+
+    stmt_result = results["response"]["result"]
+    
+    # Return rows as simple tuples
+    rows = []
+    if "rows" in stmt_result:
+        for row in stmt_result["rows"]:
+            tuple_row = tuple(col.get("value") for col in row)
+            rows.append(tuple_row)
+            
+    return rows
+
+# --- DATABASE SETUP ---
 def init_db():
-    """Initializes the database schema if it doesn't already exist."""
-    with get_db_client() as client:
-        client.execute('''
-            CREATE TABLE IF NOT EXISTS receipts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                merchant TEXT,
-                date TEXT,
-                amount REAL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+    execute_turso_sql('''
+        CREATE TABLE IF NOT EXISTS receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            merchant TEXT,
+            date TEXT,
+            amount REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
 
+# Initialize Table on App Start
 init_db()
 
 def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
-    """Checks cloud database for exact merchant, date, and amount match."""
-    with get_db_client() as client:
-        result = client.execute(
-            "SELECT id FROM receipts WHERE LOWER(merchant) = LOWER(?) AND date = ? AND amount = ?",
-            [merchant, date_str, amount]
-        )
-        return len(result.rows) > 0
+    sql = "SELECT id FROM receipts WHERE LOWER(merchant) = LOWER(?) AND date = ? AND amount = ?"
+    rows = execute_turso_sql(sql, [merchant, date_str, amount])
+    return len(rows) > 0
 
 def save_receipt_to_db(merchant: str, date_str: str, amount: float):
-    """Inserts a new receipt entry into the cloud database."""
-    with get_db_client() as client:
-        client.execute(
-            "INSERT INTO receipts (merchant, date, amount) VALUES (?, ?, ?)",
-            [merchant, date_str, amount]
-        )
+    sql = "INSERT INTO receipts (merchant, date, amount) VALUES (?, ?, ?)"
+    execute_turso_sql(sql, [merchant, date_str, amount])
 
 def query_db(sql_query: str):
-    """Executes a generated SQL query and converts rows into tuples."""
-    with get_db_client() as client:
-        try:
-            result = client.execute(sql_query)
-            return [tuple(row) for row in result.rows]
-        except Exception as e:
-            return f"Database query error: {e}"
+    try:
+        return execute_turso_sql(sql_query)
+    except Exception as e:
+        return f"Database query error: {e}"
 
 # --- HEALTH CHECK SERVER FOR RENDER / CRON-JOB ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -107,7 +144,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_bytes = await photo_file.download_as_bytearray()
         image = Image.open(io.BytesIO(photo_bytes))
 
-        # Prompt Gemini 3.5 Flash for structured extraction
         prompt = f"""
         Analyze this image. 
         Step 1: Check if it is a purchase receipt/invoice.
@@ -129,7 +165,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = data.get("date", today_str)
         amount = float(data.get("amount", 0.0))
 
-        # Multi-field business key duplicate check (Merchant + Date + Amount)
         if is_duplicate_receipt(merchant, date_str, amount):
             header = "⚠️ **Duplicate Receipt Detected!** (Exact match found in Turso Cloud DB)\n\n"
         else:
@@ -230,7 +265,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_query))
 
-    print("🤖 Bot is live connected to free Turso Cloud SQLite database via HTTP!")
+    print("🤖 Bot is live using Turso Pure HTTP API!")
     app.run_polling()
 
 if __name__ == "__main__":
