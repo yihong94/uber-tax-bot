@@ -2,7 +2,6 @@ import os
 import io
 import re
 import json
-import sqlite3
 import logging
 from datetime import datetime
 from threading import Thread
@@ -12,22 +11,29 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
 from PIL import Image
+import libsql_experimental as libsql
 
-# Initialize Environment & Gemini
+# Load Environment Variables
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TURSO_URL = os.getenv("TURSO_DATABASE_URL")
+TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
+# Configure Gemini 3.5
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-3.5-flash')
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- DATABASE SETUP ---
+# --- TURSO CLOUD DATABASE SETUP ---
+def get_db_connection():
+    """Connects to free Turso cloud SQLite database."""
+    return libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+
 def init_db():
-    conn = sqlite3.connect("receipts.db")
-    cursor = conn.cursor()
-    cursor.execute('''
+    conn = get_db_connection()
+    conn.execute('''
         CREATE TABLE IF NOT EXISTS receipts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             merchant TEXT,
@@ -39,11 +45,12 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Initialize Table on Startup
 init_db()
 
 def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
-    """Checks if a receipt with the exact same merchant, date, and amount already exists."""
-    conn = sqlite3.connect("receipts.db")
+    """Checks cloud database for exact merchant, date, and amount match."""
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id FROM receipts WHERE LOWER(merchant) = LOWER(?) AND date = ? AND amount = ?",
@@ -54,7 +61,7 @@ def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
     return result is not None
 
 def save_receipt_to_db(merchant: str, date_str: str, amount: float):
-    conn = sqlite3.connect("receipts.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO receipts (merchant, date, amount) VALUES (?, ?, ?)",
@@ -64,7 +71,7 @@ def save_receipt_to_db(merchant: str, date_str: str, amount: float):
     conn.close()
 
 def query_db(sql_query: str):
-    conn = sqlite3.connect("receipts.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(sql_query)
@@ -75,7 +82,7 @@ def query_db(sql_query: str):
         conn.close()
         return f"Database query error: {e}"
 
-# --- HEALTH CHECK SERVER ---
+# --- HEALTH CHECK SERVER FOR RENDER / CRON-JOB ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ["/health", "/"]:
@@ -95,7 +102,7 @@ def run_http_server():
 # --- TELEGRAM HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Hi! Upload a receipt photo to save it, a PDF weekly summary to calculate tax, or ask questions like 'How much did I spend on fuel this week?'"
+        "👋 Hi! Send me a photo of a receipt, an Uber weekly summary PDF, or ask questions about your fuel spending!"
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -107,7 +114,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_bytes = await photo_file.download_as_bytearray()
         image = Image.open(io.BytesIO(photo_bytes))
 
-        # Prompt Gemini for structured extraction
+        # Prompt Gemini 3.5 for structured extraction
         prompt = f"""
         Analyze this image. 
         Step 1: Check if it is a purchase receipt/invoice.
@@ -129,12 +136,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = data.get("date", today_str)
         amount = float(data.get("amount", 0.0))
 
-        # Data-level duplicate check (Merchant + Date + Amount)
+        # Check Turso Cloud DB for duplicate entry
         if is_duplicate_receipt(merchant, date_str, amount):
-            header = "⚠️ **Duplicate Receipt Detected!** (Exact match found in database)\n\n"
+            header = "⚠️ **Duplicate Receipt Detected!** (Exact match found in cloud DB)\n\n"
         else:
             save_receipt_to_db(merchant, date_str, amount)
-            header = "✅ **Receipt Saved to Database!**\n\n"
+            header = "✅ **Receipt Saved to Cloud Database!**\n\n"
 
         reply = (
             f"{header}"
@@ -153,7 +160,7 @@ async def handle_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_str = datetime.now().strftime("%Y-%m-%d")
 
     prompt = f"""
-    You are an AI assistant with access to an SQLite database table named 'receipts'.
+    You are an AI assistant with access to a cloud SQLite database table named 'receipts'.
     Table Schema:
     - id (INTEGER)
     - merchant (TEXT)
@@ -230,7 +237,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_query))
 
-    print("🤖 Bot is live with Gemini 3.5 & Data Duplicate Protection!")
+    print("🤖 Bot is live connected to free Turso Cloud SQLite database!")
     app.run_polling()
 
 if __name__ == "__main__":
