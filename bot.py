@@ -37,9 +37,9 @@ def execute_turso_sql(sql: str, args: list = None):
     formatted_args = []
     for arg in args:
         if isinstance(arg, float):
-            formatted_args.append({"type": "float", "value": str(arg)})
+            formatted_args.append({"type": "float", "value": arg})  # <-- Native float number
         elif isinstance(arg, int):
-            formatted_args.append({"type": "integer", "value": str(arg)})
+            formatted_args.append({"type": "integer", "value": arg}) # <-- Native integer number
         elif arg is None:
             formatted_args.append({"type": "null"})
         else:
