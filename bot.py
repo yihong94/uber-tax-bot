@@ -44,21 +44,19 @@ logging.basicConfig(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Hi! Send me a photo of a receipt, and I'll analyze it for you."
+        "👋 Hi! Send me a photo of a fuel receipt or upload your Uber weekly summary PDF."
     )
 
+# Handler for Receipt Images
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_message = await update.message.reply_text("🔍 Analyzing receipt...")
 
     try:
-        # Get current date as default
         today_str = datetime.now().strftime("%Y-%m-%d")
-
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         image = Image.open(io.BytesIO(photo_bytes))
 
-        # Strict & Clean Extraction Prompt
         prompt = (
             "Analyze this receipt image and return ONLY the following three fields formatted exactly like this:\n\n"
             "**Merchant:** [Store/Merchant Name]\n"
@@ -74,13 +72,54 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error processing receipt: {e}")
         await status_message.edit_text(f"❌ Failed to process receipt: {str(e)}")
 
+# Handler for Uber Summary PDFs
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    document = update.message.document
+
+    # Ensure the uploaded file is a PDF
+    if not document.file_name.endswith('.pdf'):
+        await update.message.reply_text("⚠️ Please upload a valid PDF file.")
+        return
+
+    status_message = await update.message.reply_text("📄 Processing Uber weekly summary PDF...")
+
+    try:
+        pdf_file = await document.get_file()
+        pdf_bytes = await pdf_file.download_as_bytearray()
+
+        # Prepare PDF payload for Gemini
+        pdf_part = {
+            "mime_type": "application/pdf",
+            "data": bytes(pdf_bytes)
+        }
+
+        prompt = (
+            "You are a tax assistant reading an Uber Weekly Tax/Earnings Summary PDF.\n"
+            "1. Locate the total gross earnings figure under 'Your Earnings' (or Total Gross Earnings).\n"
+            "2. Calculate exactly 32% of that total earnings figure to set aside for tax.\n\n"
+            "Return ONLY the response formatted like this:\n\n"
+            "📊 **Uber Weekly Summary**\n"
+            "**Total Earnings:** $[Amount]\n"
+            "**Tax to Set Aside (32%):** $[Calculated 32% Amount]\n\n"
+            "Do not add conversational fluff or intro text."
+        )
+
+        response = model.generate_content([prompt, pdf_part])
+        await status_message.edit_text(response.text)
+
+    except Exception as e:
+        logging.error(f"Error processing PDF: {e}")
+        await status_message.edit_text(f"❌ Failed to process PDF: {str(e)}")
+
 def main():
     # Start health check server in background thread
     Thread(target=run_http_server, daemon=True).start()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
 
     print("🤖 Bot is running...")
     app.run_polling()
