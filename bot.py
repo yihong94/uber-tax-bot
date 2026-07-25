@@ -30,15 +30,16 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 # --- TURSO HTTP API HELPER ---
 def execute_turso_sql(sql: str, args: list = None):
-    """Executes SQL statements via Turso HTTP Pipeline API (Pure Python, zero C/Rust dependencies)."""
+    """Executes SQL statements via Turso HTTP Pipeline API using indexed positional args."""
     if args is None:
         args = []
 
-    # Convert args into Turso API format
     formatted_args = []
     for arg in args:
-        if isinstance(arg, (int, float)):
-            formatted_args.append({"type": "float" if isinstance(arg, float) else "integer", "value": str(arg)})
+        if isinstance(arg, float):
+            formatted_args.append({"type": "float", "value": str(arg)})
+        elif isinstance(arg, int):
+            formatted_args.append({"type": "integer", "value": str(arg)})
         elif arg is None:
             formatted_args.append({"type": "null"})
         else:
@@ -63,23 +64,24 @@ def execute_turso_sql(sql: str, args: list = None):
     }
 
     response = requests.post(f"{TURSO_URL}/v2/pipeline", json=payload, headers=headers)
-    response.raise_for_status()
-    data = response.json()
+    
+    if not response.ok:
+        raise Exception(f"Turso API Error ({response.status_code}): {response.text}")
 
-    # Extract results
+    data = response.json()
     results = data["results"][0]
+
     if results["type"] == "error":
         raise Exception(results["error"]["message"])
 
     stmt_result = results["response"]["result"]
-    
-    # Return rows as simple tuples
+
     rows = []
     if "rows" in stmt_result:
         for row in stmt_result["rows"]:
             tuple_row = tuple(col.get("value") for col in row)
             rows.append(tuple_row)
-            
+
     return rows
 
 # --- DATABASE SETUP ---
@@ -98,12 +100,12 @@ def init_db():
 init_db()
 
 def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
-    sql = "SELECT id FROM receipts WHERE LOWER(merchant) = LOWER(?) AND date = ? AND amount = ?"
+    sql = "SELECT id FROM receipts WHERE LOWER(merchant) = LOWER(?1) AND date = ?2 AND amount = ?3"
     rows = execute_turso_sql(sql, [merchant, date_str, amount])
     return len(rows) > 0
 
 def save_receipt_to_db(merchant: str, date_str: str, amount: float):
-    sql = "INSERT INTO receipts (merchant, date, amount) VALUES (?, ?, ?)"
+    sql = "INSERT INTO receipts (merchant, date, amount) VALUES (?1, ?2, ?3)"
     execute_turso_sql(sql, [merchant, date_str, amount])
 
 def query_db(sql_query: str):
@@ -112,7 +114,7 @@ def query_db(sql_query: str):
     except Exception as e:
         return f"Database query error: {e}"
 
-# --- HEALTH CHECK SERVER FOR RENDER / CRON-JOB ---
+# --- HEALTH CHECK SERVER FOR RENDER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ["/health", "/"]:
@@ -132,7 +134,7 @@ def run_http_server():
 # --- TELEGRAM HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Hi! Upload a receipt photo to save it, a PDF weekly summary to calculate tax, or ask questions like 'How much did I spend on fuel this week?'"
+        "👋 Hi! Upload a receipt photo to save it, a PDF weekly summary to calculate tax, or ask questions like 'How much did I spend on fuel this month?'"
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -183,7 +185,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Receipt error: {e}")
         await status_message.edit_text(f"❌ Error: {str(e)}")
 
-
 async def handle_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_query = update.message.text
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -208,7 +209,7 @@ async def handle_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sql_response = model.generate_content(prompt)
         raw_sql = sql_response.text.strip().replace("```sql", "").replace("```", "")
-        
+
         query_results = query_db(raw_sql)
 
         summary_prompt = f"""
@@ -223,7 +224,7 @@ async def handle_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"Text query error: {e}")
-        await update.message.reply_text("Sorry, I couldn't process that question from the database.")
+        await update.message.reply_text(f"❌ Database Error: {str(e)}")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
@@ -253,7 +254,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"PDF error: {e}")
-        await status_message.edit_text("❌ Failed to process PDF.")
+        await status_message.edit_text(f"❌ Error: {str(e)}")
 
 # --- MAIN RUNNER ---
 def main():
