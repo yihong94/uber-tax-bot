@@ -1,0 +1,20 @@
+# Uber Bot - Cursor Rules & Context
+
+## Project Overview
+- This project is a Python-based bot deployed as a `systemd` service on an ARM64 Ubuntu OCI instance.
+- CI/CD deployments are handled automatically via GitHub Actions upon pushing to the `main` branch.
+
+## Environment & Dependency Management
+- **Package Manager**: ALWAYS use `uv` for package management and dependencies (e.g., `uv pip install ...` or `uv add ...`). Do NOT use standard `pip` commands directly unless explicitly requested.
+- **Virtual Environment**: Assume all execution takes place inside a virtual environment (`venv`) managed by `uv`.
+- **Dependencies**: Keep `requirements.txt` updated whenever new packages or dependencies are introduced.
+
+## Code Style & Architecture
+- **Language**: Python 3.10+
+- **Structure**: Keep functions modular, readable, and well-documented with clear docstrings and type hints where appropriate.
+- **Error Handling**: Use explicit `try/except` blocks with meaningful logging (via Python's `logging` module) rather than silent `pass` statements or plain `print()` statements.
+- **Secrets & Configuration**: Never hardcode sensitive API keys, tokens, or credentials in `.py` files. Always use environment variables loaded via `.env` or system environment configurations.
+
+## Git & Deployment Safety
+- **Git Commits**: Keep commit messages clear, concise, and descriptive.
+- **Server Safety**: Remember that changes pushed to `main` trigger live deployments via GitHub Actions. Ensure code is tested locally before suggesting direct pushes.

@@ -12,15 +12,32 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
 from PIL import Image
+from dataclasses import dataclass
+
+from urllib.parse import urlparse
+
+from upload import export_receipt_row, remove_receipt_row, clear_receipt_export, export_uber_summary
+from upload import google_sheets
 
 # --- ENVIRONMENT & CONFIGURATION ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+
+def normalize_turso_url(raw: str) -> str:
+    """Turn Turso libsql/https URLs into the base HTTPS origin for the HTTP API."""
+    url = raw.strip().strip("'\"")
+    if url.startswith("libsql://"):
+        url = "https://" + url[len("libsql://") :]
+    elif url and not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url.rstrip("/").split("/v2/")[0]
+
+
 # Ensure URL starts with https:// for Turso HTTP API
-TURSO_URL = os.getenv("TURSO_DATABASE_URL", "").replace("libsql://", "https://")
-TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+TURSO_URL = normalize_turso_url(os.getenv("TURSO_DATABASE_URL", ""))
+TURSO_TOKEN = (os.getenv("TURSO_AUTH_TOKEN") or "").strip().strip("'\"")
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
@@ -28,8 +45,16 @@ model = genai.GenerativeModel('gemini-3.5-flash')
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
+
+@dataclass
+class TursoResult:
+    rows: list
+    last_insert_rowid: int | None = None
+    affected_row_count: int | None = None
+
+
 # --- TURSO HTTP API HELPER ---
-def execute_turso_sql(sql: str, args: list = None):
+def execute_turso_sql(sql: str, args: list = None) -> TursoResult:
     """Executes SQL statements via Turso HTTP Pipeline API using indexed positional args and correct types."""
     if args is None:
         args = []
@@ -58,6 +83,12 @@ def execute_turso_sql(sql: str, args: list = None):
         ]
     }
 
+    if not TURSO_URL or not TURSO_TOKEN:
+        raise RuntimeError(
+            "Turso is not configured. Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in .env "
+            "(use the same values as on your OCI server)."
+        )
+
     headers = {
         "Authorization": f"Bearer {TURSO_TOKEN}",
         "Content-Type": "application/json"
@@ -66,6 +97,14 @@ def execute_turso_sql(sql: str, args: list = None):
     response = requests.post(f"{TURSO_URL}/v2/pipeline", json=payload, headers=headers)
     
     if not response.ok:
+        if response.status_code == 404 and "Host not found" in response.text:
+            host = urlparse(TURSO_URL).hostname or TURSO_URL
+            raise Exception(
+                f"Turso API Error (404): Host not found ({host}). "
+                "TURSO_DATABASE_URL must be the database libsql URL from the Turso dashboard "
+                "or `turso db show <db-name> --url` (e.g. libsql://my-db-youruser.turso.io), "
+                "not your Google/GCP project name."
+            )
         raise Exception(f"Turso API Error ({response.status_code}): {response.text}")
 
     data = response.json()
@@ -82,7 +121,15 @@ def execute_turso_sql(sql: str, args: list = None):
             tuple_row = tuple(col.get("value") for col in row)
             rows.append(tuple_row)
 
-    return rows
+    last_insert_rowid = stmt_result.get("last_insert_rowid")
+    if last_insert_rowid is not None:
+        last_insert_rowid = int(last_insert_rowid)
+
+    return TursoResult(
+        rows=rows,
+        last_insert_rowid=last_insert_rowid,
+        affected_row_count=stmt_result.get("affected_row_count"),
+    )
 
 # --- DATABASE SETUP ---
 def init_db():
@@ -96,34 +143,32 @@ def init_db():
         )
     ''')
 
-# Initialize Table on App Start
-init_db()
-
 def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
     """Checks cloud database for matching date & amount with flexible merchant matching."""
     core_merchant = merchant.split('(')[0].strip().lower()
     
     # Fetch receipts on the exact same date with the exact same amount
     sql = "SELECT merchant FROM receipts WHERE date = ?1 AND amount = ?2"
-    rows = execute_turso_sql(sql, [date_str, amount])
+    result = execute_turso_sql(sql, [date_str, amount])
     
-    if not rows:
+    if not result.rows:
         return False
         
-    for (existing_merchant,) in rows:
+    for (existing_merchant,) in result.rows:
         existing_clean = existing_merchant.split('(')[0].strip().lower()
         if core_merchant in existing_clean or existing_clean in core_merchant:
             return True
             
     return False
 
-def save_receipt_to_db(merchant: str, date_str: str, amount: float):
+def save_receipt_to_db(merchant: str, date_str: str, amount: float) -> int | None:
     sql = "INSERT INTO receipts (merchant, date, amount) VALUES (?1, ?2, ?3)"
-    execute_turso_sql(sql, [merchant, date_str, amount])
+    result = execute_turso_sql(sql, [merchant, date_str, amount])
+    return result.last_insert_rowid
 
 def query_db(sql_query: str):
     try:
-        return execute_turso_sql(sql_query)
+        return execute_turso_sql(sql_query).rows
     except Exception as e:
         return f"Database query error: {e}"
 
@@ -157,7 +202,9 @@ async def undo_last_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Deletes the single most recently added receipt entry."""
     status_message = await update.message.reply_text("⏳ Removing last uploaded receipt...")
     try:
-        latest = execute_turso_sql("SELECT id, merchant, date, amount FROM receipts ORDER BY id DESC LIMIT 1;")
+        latest = execute_turso_sql(
+            "SELECT id, merchant, date, amount FROM receipts ORDER BY id DESC LIMIT 1;"
+        ).rows
         
         if not latest:
             await status_message.edit_text("ℹ️ Your database is currently empty. Nothing to undo.")
@@ -165,12 +212,15 @@ async def undo_last_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         receipt_id, merchant, date_str, amount = latest[0]
         execute_turso_sql("DELETE FROM receipts WHERE id = ?1;", [receipt_id])
+        sheets_removed = remove_receipt_row(int(receipt_id))
+        sheets_note = "\n📊 Also removed from Google Sheets." if sheets_removed else ""
 
         reply = (
             "🗑️ **Last Receipt Removed!**\n\n"
             f"**Merchant:** {merchant}\n"
             f"**Date:** {date_str}\n"
             f"**Amount:** ${float(amount):.2f}"
+            f"{sheets_note}"
         )
         await status_message.edit_text(reply, parse_mode="Markdown")
 
@@ -183,7 +233,12 @@ async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_message = await update.message.reply_text("🧹 Clearing database...")
     try:
         execute_turso_sql("DELETE FROM receipts;")
-        await status_message.edit_text("🗑️ **Database cleared successfully!** All receipt records have been removed.", parse_mode="Markdown")
+        sheets_cleared = clear_receipt_export()
+        extra = " Google Sheets tab was cleared too." if sheets_cleared else ""
+        await status_message.edit_text(
+            f"🗑️ **Database cleared successfully!** All receipt records have been removed.{extra}",
+            parse_mode="Markdown",
+        )
     except Exception as e:
         logging.error(f"Clear DB error: {e}")
         await status_message.edit_text(f"❌ Failed to clear database: {str(e)}")
@@ -220,10 +275,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = float(data.get("amount", 0.0))
 
         if is_duplicate_receipt(merchant, date_str, amount):
-            header = "⚠️ **Duplicate Receipt Detected!** (Exact match found in Turso Cloud DB)\n\n"
+            header = (
+                "⚠️ **Duplicate Receipt Detected!** "
+                "(Match in Turso — not saved again; Google Sheets not updated.)\n\n"
+            )
         else:
-            save_receipt_to_db(merchant, date_str, amount)
-            header = "✅ **Receipt Saved to Cloud Database!**\n\n"
+            receipt_id = save_receipt_to_db(merchant, date_str, amount)
+            sheets_ok = False
+            if receipt_id is not None:
+                sheets_ok = export_receipt_row(receipt_id, merchant, date_str, amount)
+            if sheets_ok:
+                header = "✅ **Receipt Saved** (Turso + Google Sheets)\n\n"
+            elif receipt_id is not None:
+                header = (
+                    "✅ **Receipt Saved to Cloud Database!** "
+                    "_(Google Sheets skipped duplicate or sync failed — check logs.)_\n\n"
+                )
+            else:
+                header = "✅ **Receipt Saved to Cloud Database!**\n\n"
 
         reply = (
             f"{header}"
@@ -302,15 +371,49 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         response = model.generate_content([prompt, pdf_part])
-        await status_message.edit_text(response.text, parse_mode="Markdown")
+        summary_text = response.text
+        if export_uber_summary(summary_text):
+            summary_text = f"{summary_text}\n\n📊 _Copied to Google Sheets (Uber Summaries tab)._"
+        await status_message.edit_text(summary_text, parse_mode="Markdown")
 
     except Exception as e:
         logging.error(f"PDF error: {e}")
         await status_message.edit_text(f"❌ Error: {str(e)}")
 
 # --- MAIN RUNNER ---
+def _missing_required_env() -> list[str]:
+    missing: list[str] = []
+    if not TELEGRAM_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not GEMINI_API_KEY:
+        missing.append("GEMINI_API_KEY")
+    if not TURSO_URL:
+        missing.append("TURSO_DATABASE_URL")
+    if not TURSO_TOKEN:
+        missing.append("TURSO_AUTH_TOKEN")
+    return missing
+
+
 def main():
+    missing = _missing_required_env()
+    if missing:
+        logging.error("Cannot start bot — missing .env variables: %s", ", ".join(missing))
+        raise SystemExit(1)
+
+    init_db()
     Thread(target=run_http_server, daemon=True).start()
+
+    sheets_cfg = google_sheets.get_sheets_config()
+    if sheets_cfg and sheets_cfg.enabled:
+        logging.info(
+            "Google Sheets export enabled (spreadsheet_id=%s…)",
+            sheets_cfg.spreadsheet_id[:8],
+        )
+    else:
+        logging.warning(
+            "Google Sheets export is NOT configured — receipts will save to Turso only. "
+            "Set GOOGLE_SHEETS_SPREADSHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON."
+        )
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
