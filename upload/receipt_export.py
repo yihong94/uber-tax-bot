@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timezone
 
 from upload import google_sheets
+from upload.google_drive import upload_receipt_image
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +20,10 @@ def export_receipt_row(
     merchant: str,
     date_str: str,
     amount: float,
+    image_bytes: bytes | None = None,
+    image_mime_type: str = "image/jpeg",
 ) -> bool:
-    """Push a saved receipt to Google Sheets when configured.
+    """Push a saved receipt to Google Drive (image) and Google Sheets when configured.
 
     Returns True if a row was appended, False if disabled, duplicate in sheet, or error.
     """
@@ -32,12 +35,33 @@ def export_receipt_row(
         )
         return False
 
+    if google_sheets.receipt_already_in_sheet(merchant, date_str, amount):
+        logger.info(
+            "Google Sheets export skipped (duplicate in sheet): id=%s merchant=%s",
+            receipt_id,
+            merchant,
+        )
+        return False
+
+    receipt_link = ""
+    if image_bytes:
+        link = upload_receipt_image(
+            receipt_id=receipt_id,
+            date_str=date_str,
+            merchant=merchant,
+            image_bytes=image_bytes,
+            mime_type=image_mime_type,
+        )
+        if link:
+            receipt_link = link
+
     try:
         return google_sheets.append_receipt_row(
             receipt_id=receipt_id,
             merchant=merchant,
             date_str=date_str,
             amount=amount,
+            receipt_link=receipt_link,
         )
     except Exception as exc:
         logger.error(

@@ -283,7 +283,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             receipt_id = save_receipt_to_db(merchant, date_str, amount)
             sheets_ok = False
             if receipt_id is not None:
-                sheets_ok = export_receipt_row(receipt_id, merchant, date_str, amount)
+                sheets_ok = export_receipt_row(
+                    receipt_id,
+                    merchant,
+                    date_str,
+                    amount,
+                    image_bytes=bytes(photo_bytes),
+                )
             if sheets_ok:
                 header = "✅ **Receipt Saved** (Turso + Google Sheets)\n\n"
             elif receipt_id is not None:

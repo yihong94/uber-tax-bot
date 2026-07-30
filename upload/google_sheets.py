@@ -13,8 +13,13 @@ logger = logging.getLogger(__name__)
 RECEIPTS_SHEET = "Receipts"
 UBER_SHEET = "Uber Summaries"
 
-RECEIPT_HEADERS = ["Date", "Merchant", "Amount", "ID"]
+RECEIPT_HEADERS = ["Date", "Merchant", "Amount", "ID", "Receipt Link"]
 UBER_HEADERS = ["Uploaded At", "Summary Text"]
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 
 def _core_merchant(name: str) -> str:
@@ -85,19 +90,20 @@ def get_sheets_config() -> SheetsConfig | None:
     return SheetsConfig(spreadsheet_id=spreadsheet_id, enabled=enabled)
 
 
-def _open_spreadsheet():
-    import gspread
+def get_service_account_credentials():
+    """Service account credentials for Sheets and Drive."""
     from google.oauth2.service_account import Credentials
 
     info = _load_service_account_info()
     if not info:
         raise RuntimeError("Google service account credentials are not configured.")
+    return Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    credentials = Credentials.from_service_account_info(info, scopes=scopes)
+
+def _open_spreadsheet():
+    import gspread
+
+    credentials = get_service_account_credentials()
     client = gspread.authorize(credentials)
     config = get_sheets_config()
     if not config:
@@ -123,6 +129,7 @@ def append_receipt_row(
     merchant: str,
     date_str: str,
     amount: float,
+    receipt_link: str = "",
 ) -> bool:
     """Append a receipt row. Returns False if a matching row already exists."""
     if receipt_already_in_sheet(merchant, date_str, amount):
@@ -136,7 +143,7 @@ def append_receipt_row(
 
     worksheet = _worksheet(RECEIPTS_SHEET, RECEIPT_HEADERS)
     worksheet.append_row(
-        [date_str, merchant, f"{amount:.2f}", receipt_id],
+        [date_str, merchant, f"{amount:.2f}", receipt_id, receipt_link],
         value_input_option="USER_ENTERED",
     )
     return True
