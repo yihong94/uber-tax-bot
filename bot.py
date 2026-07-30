@@ -18,7 +18,11 @@ from urllib.parse import urlparse
 
 from upload import export_receipt_row, remove_receipt_row, clear_receipt_export, export_uber_summary
 from upload import google_sheets
-from upload.google_drive_auth import drive_upload_configured, using_oauth_for_drive
+from upload.google_drive_auth import (
+    drive_upload_configured,
+    using_delegated_for_drive,
+    using_oauth_for_drive,
+)
 
 # --- ENVIRONMENT & CONFIGURATION ---
 load_dotenv()
