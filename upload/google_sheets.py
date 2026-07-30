@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 RECEIPTS_SHEET = "Receipts"
 UBER_SHEET = "Uber Summaries"
 
-RECEIPT_HEADERS = ["ID", "Merchant", "Date", "Amount", "Uploaded At"]
+RECEIPT_HEADERS = ["Date", "Merchant", "Amount", "ID"]
 UBER_HEADERS = ["Uploaded At", "Summary Text"]
 
 
@@ -40,7 +40,7 @@ def receipt_already_in_sheet(merchant: str, date_str: str, amount: float) -> boo
     for row in worksheet.get_all_values()[1:]:
         if len(row) < 4:
             continue
-        row_merchant, row_date, row_amount = row[1], row[2], row[3]
+        row_date, row_merchant, row_amount = row[0], row[1], row[2]
         if row_date.strip() != date_str.strip():
             continue
         if not _amounts_match(row_amount, amount):
@@ -93,7 +93,10 @@ def _open_spreadsheet():
     if not info:
         raise RuntimeError("Google service account credentials are not configured.")
 
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
     credentials = Credentials.from_service_account_info(info, scopes=scopes)
     client = gspread.authorize(credentials)
     config = get_sheets_config()
@@ -120,7 +123,6 @@ def append_receipt_row(
     merchant: str,
     date_str: str,
     amount: float,
-    uploaded_at: str,
 ) -> bool:
     """Append a receipt row. Returns False if a matching row already exists."""
     if receipt_already_in_sheet(merchant, date_str, amount):
@@ -134,7 +136,7 @@ def append_receipt_row(
 
     worksheet = _worksheet(RECEIPTS_SHEET, RECEIPT_HEADERS)
     worksheet.append_row(
-        [receipt_id, merchant, date_str, f"{amount:.2f}", uploaded_at],
+        [date_str, merchant, f"{amount:.2f}", receipt_id],
         value_input_option="USER_ENTERED",
     )
     return True
@@ -142,7 +144,7 @@ def append_receipt_row(
 
 def delete_receipt_row_by_id(receipt_id: int) -> bool:
     worksheet = _worksheet(RECEIPTS_SHEET, RECEIPT_HEADERS)
-    ids = worksheet.col_values(1)
+    ids = worksheet.col_values(4)
     for row_index, cell in enumerate(ids[1:], start=2):
         if str(cell).strip() == str(receipt_id):
             worksheet.delete_rows(row_index)

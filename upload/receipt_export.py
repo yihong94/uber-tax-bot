@@ -38,10 +38,13 @@ def export_receipt_row(
             merchant=merchant,
             date_str=date_str,
             amount=amount,
-            uploaded_at=_uploaded_at(),
         )
     except Exception as exc:
-        logger.error("Google Sheets receipt export failed: %s", exc)
+        logger.error(
+            "Google Sheets receipt export failed: %s — "
+            "check GOOGLE_SHEETS_SPREADSHEET_ID and that the sheet is shared with the service account email.",
+            exc,
+        )
         return False
 
 
