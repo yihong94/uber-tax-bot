@@ -14,11 +14,23 @@ logger = logging.getLogger(__name__)
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
+def oauth_partially_configured() -> bool:
+    """OAuth vars present but not the full set required for Drive upload."""
+    present = sum(
+        1
+        for v in (_oauth_refresh_token(), _oauth_client_id(), _oauth_client_secret())
+        if v
+    )
+    return 0 < present < 3
+
+
 def drive_upload_configured() -> bool:
-    """True if Drive upload can run (OAuth trio or service account)."""
-    if _oauth_refresh_token():
-        return bool(_oauth_client_id() and _oauth_client_secret())
-    return google_sheets.get_sheets_config() is not None
+    """True if Drive upload can run (full OAuth trio or service account)."""
+    if using_oauth_for_drive():
+        return True
+    if google_sheets.get_sheets_config() is not None:
+        return True
+    return False
 
 
 def using_oauth_for_drive() -> bool:
