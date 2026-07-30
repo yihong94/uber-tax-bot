@@ -20,6 +20,7 @@ from upload import export_receipt_row, remove_receipt_row, clear_receipt_export,
 from upload import google_sheets
 from upload.google_drive_auth import (
     drive_upload_configured,
+    oauth_partially_configured,
     using_delegated_for_drive,
     using_oauth_for_drive,
 )
@@ -46,9 +47,23 @@ TURSO_TOKEN = (os.getenv("TURSO_AUTH_TOKEN") or "").strip().strip("'\"")
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-3.5-flash')
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+model = genai.GenerativeModel(GEMINI_MODEL)
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+
+def _gemini_error_message(exc: Exception) -> str | None:
+    """User-facing message for common Gemini API failures, or None to use generic handling."""
+    text = str(exc)
+    if "429" in text or "quota" in text.lower() or "rate" in text.lower():
+        return (
+            "⏳ **Gemini API quota reached** for today (free tier is limited per model). "
+            f"Model in use: `{GEMINI_MODEL}`. Wait until the quota resets (often midnight Pacific), "
+            "enable billing in Google AI Studio, or set `GEMINI_MODEL` in `.env` to another model "
+            "with available quota (e.g. `gemini-2.0-flash`)."
+        )
+    return None
 
 
 @dataclass
@@ -315,7 +330,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"Receipt error: {e}")
-        await status_message.edit_text(f"❌ Error: {str(e)}")
+        friendly = _gemini_error_message(e)
+        await status_message.edit_text(friendly or f"❌ Error: {str(e)}", parse_mode="Markdown")
 
 async def handle_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_query = update.message.text
@@ -356,7 +372,8 @@ async def handle_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"Text query error: {e}")
-        await update.message.reply_text(f"❌ Database Error: {str(e)}")
+        friendly = _gemini_error_message(e)
+        await update.message.reply_text(friendly or f"❌ Database Error: {str(e)}", parse_mode="Markdown")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
@@ -389,7 +406,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"PDF error: {e}")
-        await status_message.edit_text(f"❌ Error: {str(e)}")
+        friendly = _gemini_error_message(e)
+        await status_message.edit_text(friendly or f"❌ Error: {str(e)}", parse_mode="Markdown")
 
 # --- MAIN RUNNER ---
 def _missing_required_env() -> list[str]:
@@ -414,6 +432,8 @@ def main():
     init_db()
     Thread(target=run_http_server, daemon=True).start()
 
+    logging.info("Gemini model: %s", GEMINI_MODEL)
+
     sheets_cfg = google_sheets.get_sheets_config()
     if sheets_cfg and sheets_cfg.enabled:
         logging.info(
@@ -436,10 +456,16 @@ def main():
                 "Google Drive receipt upload: plain service account — personal My Drive folders "
                 "need OAuth or GOOGLE_DRIVE_DELEGATED_USER_EMAIL (Workspace) + domain-wide delegation"
             )
+        elif oauth_partially_configured():
+            logging.warning(
+                "Google Drive OAuth is incomplete on this host — set all of "
+                "GOOGLE_DRIVE_OAUTH_CLIENT_ID, GOOGLE_DRIVE_OAUTH_CLIENT_SECRET, and "
+                "GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN (or remove partial OAuth vars to use the service account)"
+            )
         else:
             logging.warning(
-                "GOOGLE_DRIVE_RECEIPTS_FOLDER_ID is set but Drive auth is incomplete "
-                "(need service account JSON or GOOGLE_DRIVE_OAUTH_* variables)"
+                "GOOGLE_DRIVE_RECEIPTS_FOLDER_ID is set but Drive auth is missing — "
+                "add GOOGLE_SERVICE_ACCOUNT_JSON (same as Sheets) or full GOOGLE_DRIVE_OAUTH_* trio"
             )
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
