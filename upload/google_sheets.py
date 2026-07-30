@@ -90,6 +90,11 @@ def get_sheets_config() -> SheetsConfig | None:
     return SheetsConfig(spreadsheet_id=spreadsheet_id, enabled=enabled)
 
 
+def load_service_account_info() -> dict[str, Any] | None:
+    """Parsed service account JSON from environment (for Drive delegation, etc.)."""
+    return _load_service_account_info()
+
+
 def get_service_account_credentials():
     """Service account credentials for Sheets and Drive."""
     from google.oauth2.service_account import Credentials

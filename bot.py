@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 from upload import export_receipt_row, remove_receipt_row, clear_receipt_export, export_uber_summary
 from upload import google_sheets
+from upload.google_drive_auth import drive_upload_configured, using_oauth_for_drive
 
 # --- ENVIRONMENT & CONFIGURATION ---
 load_dotenv()
@@ -420,6 +421,22 @@ def main():
             "Google Sheets export is NOT configured — receipts will save to Turso only. "
             "Set GOOGLE_SHEETS_SPREADSHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON."
         )
+
+    if os.getenv("GOOGLE_DRIVE_RECEIPTS_FOLDER_ID", "").strip():
+        if using_oauth_for_drive():
+            logging.info("Google Drive receipt upload: OAuth user credentials")
+        elif using_delegated_for_drive() or os.getenv("GOOGLE_DRIVE_FILE_OWNER_EMAIL", "").strip():
+            logging.info("Google Drive receipt upload: service account with user delegation")
+        elif drive_upload_configured():
+            logging.warning(
+                "Google Drive receipt upload: plain service account — personal My Drive folders "
+                "need OAuth or GOOGLE_DRIVE_DELEGATED_USER_EMAIL (Workspace) + domain-wide delegation"
+            )
+        else:
+            logging.warning(
+                "GOOGLE_DRIVE_RECEIPTS_FOLDER_ID is set but Drive auth is incomplete "
+                "(need service account JSON or GOOGLE_DRIVE_OAUTH_* variables)"
+            )
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
