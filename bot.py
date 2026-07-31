@@ -49,7 +49,7 @@ TURSO_TOKEN = (os.getenv("TURSO_AUTH_TOKEN") or "").strip().strip("'\"")
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite").strip()
 model = genai.GenerativeModel(GEMINI_MODEL)
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -64,7 +64,7 @@ def _gemini_error_message(exc: Exception) -> str | None:
             "❌ **Gemini model not available** for your API key.\n\n"
             f"Current `GEMINI_MODEL`: `{GEMINI_MODEL}`.\n"
             "Set `GEMINI_MODEL` in `.env` to a model your project supports "
-            "(e.g. `gemini-2.5-flash-lite`, `gemini-2.0-flash`), then restart the bot."
+            "(e.g. `gemini-2.0-flash-lite`, `gemini-2.5-flash-lite`), then restart the bot."
         )
     if "429" in text or "quota" in lower or "rate" in lower:
         if re.search(r"limit:\s*0\b", text) or "perday" in lower.replace("_", ""):
