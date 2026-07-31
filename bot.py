@@ -3,6 +3,8 @@ import io
 import re
 import json
 import logging
+import asyncio
+import time
 import requests
 from datetime import datetime
 from threading import Thread
@@ -47,7 +49,7 @@ TURSO_TOKEN = (os.getenv("TURSO_AUTH_TOKEN") or "").strip().strip("'\"")
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
 model = genai.GenerativeModel(GEMINI_MODEL)
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -56,7 +58,15 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 def _gemini_error_message(exc: Exception) -> str | None:
     """User-facing message for common Gemini API failures, or None to use generic handling."""
     text = str(exc)
-    if "429" in text or "quota" in text.lower() or "rate" in text.lower():
+    lower = text.lower()
+    if "404" in text and ("no longer available" in lower or "not found" in lower or "models/" in lower):
+        return (
+            "❌ **Gemini model not available** for your API key.\n\n"
+            f"Current `GEMINI_MODEL`: `{GEMINI_MODEL}`.\n"
+            "Set `GEMINI_MODEL` in `.env` to a model your project supports "
+            "(e.g. `gemini-2.0-flash`, `gemini-1.5-flash`), then restart the bot."
+        )
+    if "429" in text or "quota" in lower or "rate" in lower:
         return (
             "⏳ **Gemini API quota reached** for today (free tier is limited per model). "
             f"Model in use: `{GEMINI_MODEL}`. Wait until the quota resets (often midnight Pacific), "
@@ -64,6 +74,69 @@ def _gemini_error_message(exc: Exception) -> str | None:
             "with available quota (e.g. `gemini-2.0-flash`)."
         )
     return None
+
+
+def _gemini_retry_delay_seconds(exc: Exception) -> float | None:
+    """Parse suggested retry delay from Gemini error text, if present."""
+    text = str(exc)
+    for pattern in (
+        r"retry in (\d+(?:\.\d+)?)s",
+        r"retry_delay[^\d]*(\d+(?:\.\d+)?)",
+        r"seconds:\s*(\d+(?:\.\d+)?)",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+    return None
+
+
+def _gemini_error_is_retryable(exc: Exception) -> bool:
+    """True for transient 503/429 rate limits; false for daily quota exhaustion."""
+    text = str(exc)
+    lower = text.lower()
+    if "503" in text or "service unavailable" in lower or "overloaded" in lower:
+        return True
+    if "429" not in text and "resource exhausted" not in lower and "quota exceeded" not in lower:
+        return False
+    normalized = lower.replace("_", "").replace("-", "")
+    if "generatecontentrequestspersday" in normalized or "perdayperproject" in normalized:
+        return False
+    if re.search(r"limit:\s*0\b", text):
+        return False
+    return True
+
+
+def generate_content_with_retry(contents, **kwargs):
+    """Call Gemini with retries on transient 429/503 errors."""
+    max_retries = max(1, int(os.getenv("GEMINI_MAX_RETRIES", "3")))
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return model.generate_content(contents, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= max_retries or not _gemini_error_is_retryable(exc):
+                raise
+            delay = _gemini_retry_delay_seconds(exc)
+            if delay is None:
+                delay = float(min(2 ** (attempt - 1), 60))
+            delay = min(max(delay, 1.0), 120.0)
+            logging.warning(
+                "Gemini API retryable error (attempt %s/%s), sleeping %.1fs: %s",
+                attempt,
+                max_retries,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Gemini generate_content failed without exception")
+
+
+async def gemini_generate_content(contents, **kwargs):
+    """Async wrapper so Telegram handlers do not block the event loop during retries."""
+    return await asyncio.to_thread(generate_content_with_retry, contents, **kwargs)
 
 
 @dataclass
@@ -282,7 +355,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         {{"is_receipt": true, "merchant": "Store Name", "date": "YYYY-MM-DD", "amount": 45.50}}
         """
 
-        response = model.generate_content([prompt, image])
+        response = await gemini_generate_content([prompt, image])
         clean_text = re.sub(r'```json|```', '', response.text).strip()
         data = json.loads(clean_text)
 
@@ -355,7 +428,7 @@ async def handle_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
 
     try:
-        sql_response = model.generate_content(prompt)
+        sql_response = await gemini_generate_content(prompt)
         raw_sql = sql_response.text.strip().replace("```sql", "").replace("```", "")
 
         query_results = query_db(raw_sql)
@@ -367,7 +440,7 @@ async def handle_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         Formulate a polite, brief, and clear answer answering the user's question directly.
         """
-        answer = model.generate_content(summary_prompt)
+        answer = await gemini_generate_content(summary_prompt)
         await update.message.reply_text(answer.text)
 
     except Exception as e:
@@ -398,7 +471,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "**Tax to Set Aside (32%):** $[Calculated Amount]"
         )
 
-        response = model.generate_content([prompt, pdf_part])
+        response = await gemini_generate_content([prompt, pdf_part])
         summary_text = response.text
         if export_uber_summary(summary_text):
             summary_text = f"{summary_text}\n\n📊 _Copied to Google Sheets (Uber Summaries tab)._"
