@@ -49,7 +49,7 @@ TURSO_TOKEN = (os.getenv("TURSO_AUTH_TOKEN") or "").strip().strip("'\"")
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
 model = genai.GenerativeModel(GEMINI_MODEL)
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -64,14 +64,21 @@ def _gemini_error_message(exc: Exception) -> str | None:
             "❌ **Gemini model not available** for your API key.\n\n"
             f"Current `GEMINI_MODEL`: `{GEMINI_MODEL}`.\n"
             "Set `GEMINI_MODEL` in `.env` to a model your project supports "
-            "(e.g. `gemini-2.0-flash`, `gemini-1.5-flash`), then restart the bot."
+            "(e.g. `gemini-2.5-flash-lite`, `gemini-2.0-flash`), then restart the bot."
         )
     if "429" in text or "quota" in lower or "rate" in lower:
+        if re.search(r"limit:\s*0\b", text) or "perday" in lower.replace("_", ""):
+            return (
+                "⏳ **Gemini free-tier quota is used up** for "
+                f"`{GEMINI_MODEL}` (daily/minute limit reached).\n\n"
+                "Retries cannot fix this until quota resets or you upgrade. "
+                "Enable billing in [Google AI Studio](https://aistudio.google.com/), "
+                "wait for the daily reset, or set `GEMINI_MODEL` to another model with quota."
+            )
         return (
-            "⏳ **Gemini API quota reached** for today (free tier is limited per model). "
-            f"Model in use: `{GEMINI_MODEL}`. Wait until the quota resets (often midnight Pacific), "
-            "enable billing in Google AI Studio, or set `GEMINI_MODEL` in `.env` to another model "
-            "with available quota (e.g. `gemini-2.0-flash`)."
+            "⏳ **Gemini rate limit (429).** The bot will retry automatically when possible. "
+            f"Model: `{GEMINI_MODEL}`. If this persists, check "
+            "[rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)."
         )
     return None
 
@@ -99,11 +106,19 @@ def _gemini_error_is_retryable(exc: Exception) -> bool:
     if "429" not in text and "resource exhausted" not in lower and "quota exceeded" not in lower:
         return False
     normalized = lower.replace("_", "").replace("-", "")
-    if "generatecontentrequestspersday" in normalized or "perdayperproject" in normalized:
+    if "requestsperday" in normalized or "perdayperproject" in normalized:
         return False
     if re.search(r"limit:\s*0\b", text):
         return False
     return True
+
+
+def _log_gemini_retry_skip(exc: Exception) -> None:
+    if "429" in str(exc) or "503" in str(exc):
+        logging.info(
+            "Gemini error not retrying (daily quota or hard limit): %s",
+            exc,
+        )
 
 
 def generate_content_with_retry(contents, **kwargs):
@@ -116,6 +131,8 @@ def generate_content_with_retry(contents, **kwargs):
         except Exception as exc:
             last_exc = exc
             if attempt >= max_retries or not _gemini_error_is_retryable(exc):
+                if attempt < max_retries:
+                    _log_gemini_retry_skip(exc)
                 raise
             delay = _gemini_retry_delay_seconds(exc)
             if delay is None:
