@@ -165,21 +165,26 @@ class TursoResult:
 
 
 # --- TURSO HTTP API HELPER ---
+def _format_turso_arg(arg) -> dict:
+    """Build a Turso/Hrana pipeline arg. Values must be JSON strings (not bare ints)."""
+    if arg is None:
+        return {"type": "null"}
+    # bool is a subclass of int — treat as text to avoid accidental integer encoding.
+    if isinstance(arg, bool):
+        return {"type": "text", "value": str(arg)}
+    if isinstance(arg, float):
+        return {"type": "float", "value": str(arg)}
+    if isinstance(arg, int):
+        return {"type": "integer", "value": str(arg)}
+    return {"type": "text", "value": str(arg)}
+
+
 def execute_turso_sql(sql: str, args: list = None) -> TursoResult:
     """Executes SQL statements via Turso HTTP Pipeline API using indexed positional args and correct types."""
     if args is None:
         args = []
 
-    formatted_args = []
-    for arg in args:
-        if isinstance(arg, float):
-            formatted_args.append({"type": "float", "value": arg})
-        elif isinstance(arg, int):
-            formatted_args.append({"type": "integer", "value": arg})
-        elif arg is None:
-            formatted_args.append({"type": "null"})
-        else:
-            formatted_args.append({"type": "text", "value": str(arg)})
+    formatted_args = [_format_turso_arg(arg) for arg in args]
 
     is_write = sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
     # Wrap writes in an explicit transaction so the row is committed before we respond.
@@ -303,7 +308,7 @@ def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
     
     # Fetch receipts on the exact same date with the exact same amount
     sql = "SELECT merchant FROM receipts WHERE date = ?1 AND amount = ?2"
-    result = execute_turso_sql(sql, [date_str, amount])
+    result = execute_turso_sql(sql, [str(date_str), float(amount)])
     
     if not result.rows:
         return False
@@ -327,7 +332,18 @@ def save_receipt_to_db(
         "INSERT INTO receipts (merchant, date, amount, item, category) "
         "VALUES (?1, ?2, ?3, ?4, ?5)"
     )
-    result = execute_turso_sql(sql, [merchant, date_str, amount, item, category])
+    # Text columns must always be strings (Gemini may return bare ints for dates/days).
+    text_or_none = lambda v: None if v is None else str(v)
+    result = execute_turso_sql(
+        sql,
+        [
+            str(merchant),
+            str(date_str),
+            float(amount),
+            text_or_none(item),
+            text_or_none(category),
+        ],
+    )
     receipt_id = result.last_insert_rowid
     if receipt_id is None:
         logging.error(
@@ -512,15 +528,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_message.edit_text("⚠️ This photo does not appear to be a receipt. Please upload a clear receipt image.")
             return
 
-        merchant = data.get("merchant", "Unknown")
-        date_str = data.get("date", today_str)
+        merchant = str(data.get("merchant", "Unknown"))
+        date_str = str(data.get("date", today_str))
         amount = float(data.get("amount", 0.0))
         item = data.get("item") or None
         category = data.get("category") or None
-        if isinstance(item, str):
-            item = item.strip() or None
-        if isinstance(category, str):
-            category = category.strip().lower() or None
+        if item is not None:
+            item = str(item).strip() or None
+        if category is not None:
+            category = str(category).strip().lower() or None
 
         if is_duplicate_receipt(merchant, date_str, amount):
             header = (
