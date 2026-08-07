@@ -412,4 +412,6 @@ def dashboard():
 
 if __name__ == "__main__":
     port = int(os.environ.get("DASHBOARD_PORT", os.environ.get("PORT", 5000)))
-    app.run(host="127.0.0.1", port=port, debug=True)
+    host = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
+    debug = os.environ.get("FLASK_DEBUG", "0").lower() in ("1", "true", "yes")
+    app.run(host=host, port=port, debug=debug)

@@ -20,7 +20,14 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
+            set -e
             cd /home/ubuntu/uber-tax-bot
             git pull origin main
-            /home/ubuntu/.local/bin/uv sync
+            /home/ubuntu/.local/bin/uv pip install -r requirements.txt -p .venv
+            sudo cp /home/ubuntu/uber-tax-bot/deploy/uber-tax-web.service /etc/systemd/system/uber-tax-web.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now uber-tax-web.service
             sudo systemctl restart uber-tax-bot.service
+            sudo systemctl restart uber-tax-web.service
+            sudo systemctl is-active uber-tax-bot.service
+            sudo systemctl is-active uber-tax-web.service

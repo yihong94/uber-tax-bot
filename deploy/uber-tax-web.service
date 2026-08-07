@@ -1,0 +1,18 @@
+[Unit]
+Description=Uber Tax Dashboard Web Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/uber-tax-bot
+EnvironmentFile=-/home/ubuntu/uber-tax-bot/.env
+Environment=DASHBOARD_HOST=0.0.0.0
+Environment=DASHBOARD_PORT=5000
+Environment=FLASK_DEBUG=0
+ExecStart=/home/ubuntu/uber-tax-bot/.venv/bin/python /home/ubuntu/uber-tax-bot/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
