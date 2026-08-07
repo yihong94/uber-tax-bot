@@ -284,6 +284,19 @@ def init_db():
     _ensure_column("item", "TEXT")
     _ensure_column("category", "TEXT")
 
+    execute_turso_sql('''
+        CREATE TABLE IF NOT EXISTS earnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            gross_earnings REAL NOT NULL,
+            uber_fees REAL DEFAULT 0.0,
+            net_payout REAL NOT NULL,
+            tips REAL DEFAULT 0.0,
+            source TEXT DEFAULT 'Uber Eats'
+        )
+    ''')
+    logging.info("Ensured Turso tables: receipts, earnings")
+
 def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
     """Checks cloud database for matching date & amount with flexible merchant matching."""
     core_merchant = merchant.split('(')[0].strip().lower()
