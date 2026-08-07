@@ -325,6 +325,49 @@ def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
             
     return False
 
+def save_earnings_to_db(
+    date_str: str,
+    gross_earnings: float,
+    uber_fees: float,
+    net_payout: float,
+    tips: float = 0.0,
+    source: str = "Uber Eats",
+) -> int | None:
+    """Insert an Uber earnings row and return its id after commit + read-back."""
+    sql = (
+        "INSERT INTO earnings (date, gross_earnings, uber_fees, net_payout, tips, source) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+    )
+    result = execute_turso_sql(
+        sql,
+        [
+            str(date_str),
+            float(gross_earnings),
+            float(uber_fees),
+            float(net_payout),
+            float(tips),
+            str(source),
+        ],
+    )
+    earnings_id = result.last_insert_rowid
+    if earnings_id is None:
+        logging.error(
+            "Turso earnings INSERT returned no id for date=%s gross=%s",
+            date_str,
+            gross_earnings,
+        )
+        return None
+
+    verify = execute_turso_sql(
+        "SELECT id FROM earnings WHERE id = ?1;",
+        [earnings_id],
+    )
+    if not verify.rows:
+        logging.error("Turso earnings INSERT for id=%s was not visible on read-back", earnings_id)
+        return None
+    return earnings_id
+
+
 def save_receipt_to_db(
     merchant: str,
     date_str: str,
@@ -703,24 +746,74 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_message = await update.message.reply_text("📄 Processing Uber summary...")
 
     try:
+        today_str = datetime.now().strftime("%Y-%m-%d")
         pdf_file = await document.get_file()
         pdf_bytes = await pdf_file.download_as_bytearray()
 
         pdf_part = {"mime_type": "application/pdf", "data": bytes(pdf_bytes)}
-        prompt = (
-            "You are a tax assistant reading an Uber Weekly Summary PDF.\n"
-            "1. Find total gross earnings under 'Your Earnings'.\n"
-            "2. Calculate 32% for tax set-aside.\n\n"
-            "Return ONLY:\n"
-            "📊 **Uber Weekly Summary**\n"
-            "**Total Earnings:** $[Amount]\n"
-            "**Tax to Set Aside (32%):** $[Calculated Amount]"
-        )
+        prompt = f"""
+        You are a tax assistant reading an Uber / Uber Eats weekly summary PDF.
+        Extract payout figures and return STRICT JSON only (no markdown):
+        {{
+          "date": "YYYY-MM-DD",
+          "gross_earnings": 0.00,
+          "uber_fees": 0.00,
+          "net_payout": 0.00,
+          "tips": 0.00,
+          "source": "Uber Eats"
+        }}
+        Rules:
+        - date: week end date or statement date if available, else '{today_str}'
+        - gross_earnings: total gross / Your Earnings (number only)
+        - uber_fees: service/Uber fees if listed, else 0
+        - net_payout: amount paid out / net if listed; else gross_earnings - uber_fees
+        - tips: tips if listed, else 0
+        - source: "Uber Eats" unless clearly Uber trips only, then "Uber"
+        """
 
         response = await gemini_generate_content([prompt, pdf_part])
-        summary_text = response.text
+        clean_text = re.sub(r'```json|```', '', response.text).strip()
+        data = json.loads(clean_text)
+
+        date_str = str(data.get("date", today_str))
+        gross_earnings = float(data.get("gross_earnings", 0.0) or 0.0)
+        uber_fees = float(data.get("uber_fees", 0.0) or 0.0)
+        net_payout = float(data.get("net_payout", 0.0) or 0.0)
+        tips = float(data.get("tips", 0.0) or 0.0)
+        source = str(data.get("source") or "Uber Eats")
+
+        if net_payout <= 0 and gross_earnings > 0:
+            net_payout = max(gross_earnings - uber_fees, 0.0)
+
+        tax_set_aside = gross_earnings * 0.32
+
+        earnings_id = save_earnings_to_db(
+            date_str=date_str,
+            gross_earnings=gross_earnings,
+            uber_fees=uber_fees,
+            net_payout=net_payout,
+            tips=tips,
+            source=source,
+        )
+
+        summary_text = (
+            "📊 **Uber Weekly Summary**\n"
+            f"**Date:** {date_str}\n"
+            f"**Gross Earnings:** ${gross_earnings:.2f}\n"
+            f"**Uber Fees:** ${uber_fees:.2f}\n"
+            f"**Tips:** ${tips:.2f}\n"
+            f"**Net Payout:** ${net_payout:.2f}\n"
+            f"**Tax to Set Aside (32%):** ${tax_set_aside:.2f}\n"
+            f"**Source:** {source}"
+        )
+        if earnings_id is not None:
+            summary_text += f"\n\n💾 _Saved to Turso earnings (id={earnings_id})._"
+        else:
+            summary_text += "\n\n⚠️ _Could not save earnings row to Turso — check logs._"
+
         if export_uber_summary(summary_text):
-            summary_text = f"{summary_text}\n\n📊 _Copied to Google Sheets (Uber Summaries tab)._"
+            summary_text += "\n📊 _Copied to Google Sheets (Uber Summaries tab)._"
+
         await status_message.edit_text(summary_text, parse_mode="Markdown")
 
     except Exception as e:
