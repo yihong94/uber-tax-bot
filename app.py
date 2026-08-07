@@ -35,13 +35,13 @@ def execute_turso_sql(sql: str, args: list | None = None) -> list[tuple]:
 
     formatted_args = []
     for arg in args:
-        # Turso/Hrana expects arg values as JSON strings, not bare integers.
+        # float → JSON number (f64); integer → string value; text → str.
         if arg is None:
             formatted_args.append({"type": "null"})
         elif isinstance(arg, bool):
             formatted_args.append({"type": "text", "value": str(arg)})
         elif isinstance(arg, float):
-            formatted_args.append({"type": "float", "value": str(arg)})
+            formatted_args.append({"type": "float", "value": float(arg)})
         elif isinstance(arg, int):
             formatted_args.append({"type": "integer", "value": str(arg)})
         else:

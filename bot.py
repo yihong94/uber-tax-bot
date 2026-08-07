@@ -166,14 +166,19 @@ class TursoResult:
 
 # --- TURSO HTTP API HELPER ---
 def _format_turso_arg(arg) -> dict:
-    """Build a Turso/Hrana pipeline arg. Values must be JSON strings (not bare ints)."""
+    """Build a Turso/Hrana pipeline arg with the value type Turso expects.
+
+    - float / REAL columns: JSON number (f64), not a string — pass Python float
+    - integer columns: value as string (Hrana borrowed-string encoding)
+    - text columns: Python str (merchant, date, item, category, etc.)
+    """
     if arg is None:
         return {"type": "null"}
-    # bool is a subclass of int — treat as text to avoid accidental integer encoding.
+    # bool is a subclass of int — never send as integer/float.
     if isinstance(arg, bool):
         return {"type": "text", "value": str(arg)}
     if isinstance(arg, float):
-        return {"type": "float", "value": str(arg)}
+        return {"type": "float", "value": float(arg)}
     if isinstance(arg, int):
         return {"type": "integer", "value": str(arg)}
     return {"type": "text", "value": str(arg)}
