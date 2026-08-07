@@ -6,6 +6,7 @@ import logging
 import asyncio
 import time
 import requests
+from calendar import monthrange
 from datetime import datetime
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -180,18 +181,30 @@ def execute_turso_sql(sql: str, args: list = None) -> TursoResult:
         else:
             formatted_args.append({"type": "text", "value": str(arg)})
 
-    payload = {
-        "requests": [
+    is_write = sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+    # Wrap writes in an explicit transaction so the row is committed before we respond.
+    if is_write:
+        pipeline_requests = [
+            {"type": "execute", "stmt": {"sql": "BEGIN", "args": []}},
             {
                 "type": "execute",
-                "stmt": {
-                    "sql": sql,
-                    "args": formatted_args
-                }
+                "stmt": {"sql": sql, "args": formatted_args},
             },
-            {"type": "close"}
+            {"type": "execute", "stmt": {"sql": "COMMIT", "args": []}},
+            {"type": "close"},
         ]
-    }
+        result_index = 1
+    else:
+        pipeline_requests = [
+            {
+                "type": "execute",
+                "stmt": {"sql": sql, "args": formatted_args},
+            },
+            {"type": "close"},
+        ]
+        result_index = 0
+
+    payload = {"requests": pipeline_requests}
 
     if not TURSO_URL or not TURSO_TOKEN:
         raise RuntimeError(
@@ -218,11 +231,11 @@ def execute_turso_sql(sql: str, args: list = None) -> TursoResult:
         raise Exception(f"Turso API Error ({response.status_code}): {response.text}")
 
     data = response.json()
-    results = data["results"][0]
+    for step in data.get("results", []):
+        if step.get("type") == "error":
+            raise Exception(step["error"]["message"])
 
-    if results["type"] == "error":
-        raise Exception(results["error"]["message"])
-
+    results = data["results"][result_index]
     stmt_result = results["response"]["result"]
 
     rows = []
@@ -272,9 +285,28 @@ def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
     return False
 
 def save_receipt_to_db(merchant: str, date_str: str, amount: float) -> int | None:
+    """Insert a receipt and return its id only after the write has completed."""
     sql = "INSERT INTO receipts (merchant, date, amount) VALUES (?1, ?2, ?3)"
     result = execute_turso_sql(sql, [merchant, date_str, amount])
-    return result.last_insert_rowid
+    receipt_id = result.last_insert_rowid
+    if receipt_id is None:
+        logging.error(
+            "Turso INSERT returned no last_insert_rowid for merchant=%s date=%s amount=%s",
+            merchant,
+            date_str,
+            amount,
+        )
+        return None
+
+    # Confirm the row is readable before callers reply to the user.
+    verify = execute_turso_sql(
+        "SELECT id FROM receipts WHERE id = ?1;",
+        [receipt_id],
+    )
+    if not verify.rows:
+        logging.error("Turso INSERT for id=%s was not visible on read-back", receipt_id)
+        return None
+    return receipt_id
 
 def query_db(sql_query: str):
     try:
@@ -423,25 +455,53 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         friendly = _gemini_error_message(e)
         await status_message.edit_text(friendly or f"❌ Error: {str(e)}", parse_mode="Markdown")
 
+def _month_filter_examples(today: datetime) -> str:
+    """Concrete month-range SQL examples for the SQL-generation prompt."""
+    year, month = today.year, today.month
+    last_day = monthrange(year, month)[1]
+    month_prefix = f"{year}-{month:02d}"
+    month_start = f"{month_prefix}-01"
+    month_end = f"{month_prefix}-{last_day:02d}"
+    return (
+        f"Today is {today.strftime('%Y-%m-%d')}. "
+        f"For 'this month' use date >= '{month_start}' AND date <= '{month_end}' "
+        f"(or date LIKE '{month_prefix}%'). "
+        "For a named month like June, resolve the year from context "
+        f"(default to {year} if unspecified) and use the full calendar range, e.g. "
+        f"date >= '{year}-06-01' AND date <= '{year}-06-30' "
+        f"(or date LIKE '{year}-06%'). "
+        "Never filter months with strftime, MONTH(), or English month names in LIKE."
+    )
+
+
 async def handle_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_query = update.message.text
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now()
+    today_str = today.strftime("%Y-%m-%d")
+    month_rules = _month_filter_examples(today)
 
     prompt = f"""
     You are an AI assistant with access to a cloud SQLite database table named 'receipts'.
     Table Schema:
     - id (INTEGER)
     - merchant (TEXT)
-    - date (TEXT, YYYY-MM-DD)
+    - date (TEXT, YYYY-MM-DD)  -- always ISO date strings, never month names
     - amount (REAL)
 
     Current Date Today: {today_str}
+    Month filtering rules: {month_rules}
 
     User Question: "{user_query}"
 
     Task:
     1. Write a single SQLite SELECT statement to answer the question.
-    2. Output ONLY the raw SQL query with no markdown, formatting, or extra text.
+    2. When the question refers to a calendar month (e.g. "June", "this month", "last month"),
+       filter with a date range:
+         date >= 'YYYY-MM-01' AND date <= 'YYYY-MM-DD'
+       or equivalently:
+         date LIKE 'YYYY-MM%'
+       so every receipt dated in that month is included in aggregates (SUM/COUNT/AVG).
+    3. Output ONLY the raw SQL query with no markdown, formatting, or extra text.
     """
 
     try:
