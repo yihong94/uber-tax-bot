@@ -255,6 +255,19 @@ def execute_turso_sql(sql: str, args: list = None) -> TursoResult:
     )
 
 # --- DATABASE SETUP ---
+def _ensure_column(column_name: str, column_type: str) -> None:
+    """Add a column to receipts if it does not already exist."""
+    try:
+        execute_turso_sql(
+            f"ALTER TABLE receipts ADD COLUMN {column_name} {column_type}"
+        )
+        logging.info("Added receipts.%s column", column_name)
+    except Exception as exc:
+        if "duplicate column" in str(exc).lower():
+            return
+        logging.warning("Could not ensure column %s: %s", column_name, exc)
+
+
 def init_db():
     execute_turso_sql('''
         CREATE TABLE IF NOT EXISTS receipts (
@@ -262,9 +275,14 @@ def init_db():
             merchant TEXT,
             date TEXT,
             amount REAL,
+            item TEXT,
+            category TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Existing databases created before item/category need these columns.
+    _ensure_column("item", "TEXT")
+    _ensure_column("category", "TEXT")
 
 def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
     """Checks cloud database for matching date & amount with flexible merchant matching."""
@@ -284,10 +302,19 @@ def is_duplicate_receipt(merchant: str, date_str: str, amount: float) -> bool:
             
     return False
 
-def save_receipt_to_db(merchant: str, date_str: str, amount: float) -> int | None:
+def save_receipt_to_db(
+    merchant: str,
+    date_str: str,
+    amount: float,
+    item: str | None = None,
+    category: str | None = None,
+) -> int | None:
     """Insert a receipt and return its id only after the write has completed."""
-    sql = "INSERT INTO receipts (merchant, date, amount) VALUES (?1, ?2, ?3)"
-    result = execute_turso_sql(sql, [merchant, date_str, amount])
+    sql = (
+        "INSERT INTO receipts (merchant, date, amount, item, category) "
+        "VALUES (?1, ?2, ?3, ?4, ?5)"
+    )
+    result = execute_turso_sql(sql, [merchant, date_str, amount, item, category])
     receipt_id = result.last_insert_rowid
     if receipt_id is None:
         logging.error(
@@ -337,7 +364,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Hi Justin! Upload a receipt photo to save it, a PDF weekly summary to calculate tax, or ask questions like 'How much did I spend on fuel this month?'\n\n"
         "Commands:\n"
         "• /undo - Remove the last uploaded receipt\n"
-        "• /cleardb - Delete all receipts and start fresh"
+        "• /cleardb - Delete all receipts and start fresh\n"
+        "• /dump - Show recent raw Turso receipt rows (for debugging)"
     )
 
 async def undo_last_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,6 +413,60 @@ async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Clear DB error: {e}")
         await status_message.edit_text(f"❌ Failed to clear database: {str(e)}")
 
+
+async def dump_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dump recent raw Turso receipt rows for debugging date/category storage."""
+    status_message = await update.message.reply_text("🧾 Fetching recent Turso rows...")
+    try:
+        limit = 30
+        if context.args:
+            try:
+                limit = max(1, min(100, int(context.args[0])))
+            except ValueError:
+                pass
+
+        rows = execute_turso_sql(
+            "SELECT id, merchant, date, amount, item, category, created_at "
+            "FROM receipts ORDER BY id DESC LIMIT ?1;",
+            [limit],
+        ).rows
+
+        logging.info("Turso /dump (%s rows): %s", len(rows), rows)
+
+        if not rows:
+            await status_message.edit_text("ℹ️ Turso `receipts` table is empty.")
+            return
+
+        lines = [
+            f"🧾 **Turso dump** (latest {len(rows)} row(s))",
+            "`id | merchant | date | amount | item | category | created_at`",
+            "",
+        ]
+        for row in rows:
+            rid, merchant, date_str, amount, item, category, created_at = row
+            try:
+                amount_fmt = f"{float(amount):.2f}"
+            except (TypeError, ValueError):
+                amount_fmt = str(amount)
+            lines.append(
+                f"`{rid}` | {merchant} | `{date_str}` | ${amount_fmt} | "
+                f"{item or '—'} | {category or '—'} | `{created_at or '—'}`"
+            )
+
+        text = "\n".join(lines)
+        # Telegram message limit ~4096 chars; split if needed.
+        if len(text) <= 3900:
+            await status_message.edit_text(text, parse_mode="Markdown")
+            return
+
+        await status_message.edit_text(text[:3900] + "\n…_(truncated)_", parse_mode="Markdown")
+        for start in range(3900, len(text), 3900):
+            await update.message.reply_text(text[start : start + 3900], parse_mode="Markdown")
+    except Exception as e:
+        logging.error("Dump DB error: %s", e)
+        await status_message.edit_text(f"❌ Failed to dump database: {str(e)}")
+
+
 # --- TELEGRAM MESSAGE HANDLERS ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_message = await update.message.reply_text("🔍 Analyzing receipt...")
@@ -396,12 +478,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image = Image.open(io.BytesIO(photo_bytes))
 
         prompt = f"""
-        Analyze this image. 
+        Analyze this image.
         Step 1: Check if it is a purchase receipt/invoice.
         Step 2: If NOT a receipt, return ONLY JSON: {{"is_receipt": false}}
-        Step 3: If it IS a receipt, extract merchant, date (YYYY-MM-DD, or '{today_str}' if missing/unclear), and total paid amount (number only, e.g. 45.50).
+        Step 3: If it IS a receipt, extract:
+          - merchant
+          - date as YYYY-MM-DD (or '{today_str}' if missing/unclear)
+          - total paid amount (number only, e.g. 45.50)
+          - item: brief item/description if clear (e.g. "Diesel", "Unleaded 91"), else null
+          - category: one of fuel, food, parking, tolls, maintenance, other (lowercase), else null
         Return output STRICTLY as valid JSON with no markdown tags:
-        {{"is_receipt": true, "merchant": "Store Name", "date": "YYYY-MM-DD", "amount": 45.50}}
+        {{"is_receipt": true, "merchant": "Store Name", "date": "YYYY-MM-DD", "amount": 45.50, "item": "Diesel", "category": "fuel"}}
         """
 
         response = await gemini_generate_content([prompt, image])
@@ -415,6 +502,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         merchant = data.get("merchant", "Unknown")
         date_str = data.get("date", today_str)
         amount = float(data.get("amount", 0.0))
+        item = data.get("item") or None
+        category = data.get("category") or None
+        if isinstance(item, str):
+            item = item.strip() or None
+        if isinstance(category, str):
+            category = category.strip().lower() or None
 
         if is_duplicate_receipt(merchant, date_str, amount):
             header = (
@@ -422,7 +515,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "(Match in Turso — not saved again; Google Sheets not updated.)\n\n"
             )
         else:
-            receipt_id = save_receipt_to_db(merchant, date_str, amount)
+            receipt_id = save_receipt_to_db(
+                merchant, date_str, amount, item=item, category=category
+            )
             sheets_ok = False
             if receipt_id is not None:
                 sheets_ok = export_receipt_row(
@@ -448,6 +543,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"**Date:** {date_str}\n"
             f"**Total Paid:** ${amount:.2f}"
         )
+        if item:
+            reply += f"\n**Item:** {item}"
+        if category:
+            reply += f"\n**Category:** {category}"
         await status_message.edit_text(reply, parse_mode="Markdown")
 
     except Exception as e:
@@ -462,15 +561,45 @@ def _month_filter_examples(today: datetime) -> str:
     month_prefix = f"{year}-{month:02d}"
     month_start = f"{month_prefix}-01"
     month_end = f"{month_prefix}-{last_day:02d}"
+    mm = f"{month:02d}"
     return (
         f"Today is {today.strftime('%Y-%m-%d')}. "
-        f"For 'this month' use date >= '{month_start}' AND date <= '{month_end}' "
-        f"(or date LIKE '{month_prefix}%'). "
-        "For a named month like June, resolve the year from context "
-        f"(default to {year} if unspecified) and use the full calendar range, e.g. "
-        f"date >= '{year}-06-01' AND date <= '{year}-06-30' "
-        f"(or date LIKE '{year}-06%'). "
-        "Never filter months with strftime, MONTH(), or English month names in LIKE."
+        f"Dates may be stored as YYYY-MM-DD (e.g. '{month_start}') OR DD/MM/YYYY "
+        f"(e.g. '01/{mm}/{year}'). "
+        "For month filters, match BOTH formats with OR, for example for this month:\n"
+        f"  (date >= '{month_start}' AND date <= '{month_end}')\n"
+        f"  OR date LIKE '{month_prefix}%'\n"
+        f"  OR date LIKE '__/{mm}/{year}'\n"
+        f"  OR date LIKE '%/{mm}/{year}'\n"
+        "For a named month like June (default year from context if unspecified):\n"
+        f"  (date >= '{year}-06-01' AND date <= '{year}-06-30')\n"
+        f"  OR date LIKE '{year}-06%'\n"
+        f"  OR date LIKE '__/06/{year}'\n"
+        f"  OR date LIKE '%/06/{year}'\n"
+        "Never use strftime, MONTH(), or English month names in LIKE against the date column."
+    )
+
+
+def _fuel_filter_sql_guidance() -> str:
+    """SQL patterns for fuel-related natural-language questions."""
+    return (
+        "For fuel / petrol / diesel / gas station questions, use case-insensitive "
+        "wildcard matching across merchant, item, AND category, e.g.:\n"
+        "  (\n"
+        "    LOWER(COALESCE(merchant, '')) LIKE '%bp%'\n"
+        "    OR LOWER(COALESCE(merchant, '')) LIKE '%shell%'\n"
+        "    OR LOWER(COALESCE(merchant, '')) LIKE '%caltex%'\n"
+        "    OR LOWER(COALESCE(merchant, '')) LIKE '%ampol%'\n"
+        "    OR LOWER(COALESCE(merchant, '')) LIKE '%7-eleven%'\n"
+        "    OR LOWER(COALESCE(merchant, '')) LIKE '%fuel%'\n"
+        "    OR LOWER(COALESCE(merchant, '')) LIKE '%petrol%'\n"
+        "    OR LOWER(COALESCE(category, '')) LIKE '%fuel%'\n"
+        "    OR LOWER(COALESCE(item, '')) LIKE '%fuel%'\n"
+        "    OR LOWER(COALESCE(item, '')) LIKE '%diesel%'\n"
+        "    OR LOWER(COALESCE(item, '')) LIKE '%petrol%'\n"
+        "    OR LOWER(COALESCE(item, '')) LIKE '%unleaded%'\n"
+        "  )\n"
+        "Combine fuel filters with month filters using AND when both are requested."
     )
 
 
@@ -479,29 +608,35 @@ async def handle_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now()
     today_str = today.strftime("%Y-%m-%d")
     month_rules = _month_filter_examples(today)
+    fuel_rules = _fuel_filter_sql_guidance()
 
     prompt = f"""
     You are an AI assistant with access to a cloud SQLite database table named 'receipts'.
     Table Schema:
     - id (INTEGER)
     - merchant (TEXT)
-    - date (TEXT, YYYY-MM-DD)  -- always ISO date strings, never month names
+    - date (TEXT)  -- may be YYYY-MM-DD or DD/MM/YYYY
     - amount (REAL)
+    - item (TEXT, nullable)  -- e.g. Diesel, Unleaded 91
+    - category (TEXT, nullable)  -- e.g. fuel, food, parking
 
     Current Date Today: {today_str}
-    Month filtering rules: {month_rules}
+
+    Month filtering rules:
+    {month_rules}
+
+    Fuel / petrol search rules:
+    {fuel_rules}
 
     User Question: "{user_query}"
 
     Task:
     1. Write a single SQLite SELECT statement to answer the question.
     2. When the question refers to a calendar month (e.g. "June", "this month", "last month"),
-       filter with a date range:
-         date >= 'YYYY-MM-01' AND date <= 'YYYY-MM-DD'
-       or equivalently:
-         date LIKE 'YYYY-MM%'
-       so every receipt dated in that month is included in aggregates (SUM/COUNT/AVG).
-    3. Output ONLY the raw SQL query with no markdown, formatting, or extra text.
+       filter dates flexibly for BOTH YYYY-MM-DD and DD/MM/YYYY as described above.
+    3. When the question is about fuel/petrol/diesel/gas, use the fuel wildcard OR-group above
+       so merchant, item, and category are all searched case-insensitively.
+    4. Output ONLY the raw SQL query with no markdown, formatting, or extra text.
     """
 
     try:
@@ -624,13 +759,14 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("undo", undo_last_command))
     app.add_handler(CommandHandler("cleardb", clear_db_command))
+    app.add_handler(CommandHandler("dump", dump_db_command))
 
     # Message handlers
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_query))
 
-    print("🤖 Bot is live with /undo and /cleardb functionality!")
+    print("🤖 Bot is live with /undo, /cleardb, and /dump!")
     app.run_polling()
 
 if __name__ == "__main__":
