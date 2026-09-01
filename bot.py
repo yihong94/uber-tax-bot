@@ -517,6 +517,49 @@ async def delete_receipt_command(update: Update, context: ContextTypes.DEFAULT_T
         logging.error(f"Delete error: {e}")
         await status_message.edit_text(f"❌ Failed to delete receipt: {str(e)}")
 
+
+async def handle_natural_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle plain-text requests like 'delete 123' or 'remove receipt 123'."""
+    text = (update.message.text or "").strip()
+    m = re.search(r'(?i)^(?:delete|remove)(?: receipt)?\s+(\d+)', text)
+    if not m:
+        return
+
+    rid = int(m.group(1))
+    owner_chat = os.getenv("TELEGRAM_OWNER_CHAT_ID")
+    if owner_chat and str(getattr(update.effective_user, 'id', '')) != str(owner_chat):
+        await update.message.reply_text("❌ You are not authorized to delete receipts.")
+        return
+
+    status_message = await update.message.reply_text(f"⏳ Deleting receipt id={rid}...")
+    try:
+        rows = execute_turso_sql(
+            "SELECT id, merchant, date, amount FROM receipts WHERE id = ?1;",
+            [rid],
+        ).rows
+
+        if not rows:
+            await status_message.edit_text(f"ℹ️ No receipt found with id={rid}.")
+            return
+
+        receipt_id, merchant, date_str, amount = rows[0]
+        execute_turso_sql("DELETE FROM receipts WHERE id = ?1;", [receipt_id])
+        sheets_removed = remove_receipt_row(int(receipt_id))
+        sheets_note = "\n📊 Also removed from Google Sheets." if sheets_removed else ""
+
+        reply = (
+            "🗑️ **Receipt Deleted!**\n\n"
+            f"**Merchant:** {merchant}\n"
+            f"**Date:** {date_str}\n"
+            f"**Amount:** ${float(amount):.2f}"
+            f"{sheets_note}"
+        )
+        await status_message.edit_text(reply, parse_mode="Markdown")
+
+    except Exception as e:
+        logging.error(f"Natural delete error: {e}")
+        await status_message.edit_text(f"❌ Failed to delete receipt: {str(e)}")
+
 async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Deletes all receipt records from the cloud database."""
     status_message = await update.message.reply_text("🧹 Clearing database...")
@@ -954,6 +997,8 @@ def main():
     # Message handlers
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
+    # natural-language delete (e.g. "delete 123") — must be checked before generic text handler
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'(?i)^(?:delete|remove)(?: receipt)?\s+\d+'), handle_natural_delete))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_query))
 
     print("🤖 Bot is live with /undo, /cleardb, /dump, and /delete <id>!")
