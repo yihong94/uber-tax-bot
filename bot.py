@@ -475,6 +475,48 @@ async def undo_last_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Undo error: {e}")
         await status_message.edit_text(f"❌ Failed to remove last receipt: {str(e)}")
 
+
+async def delete_receipt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes a specific receipt row by its Turso id: /delete <id>"""
+    status_message = await update.message.reply_text("⏳ Deleting receipt...")
+    try:
+        if not context.args:
+            await status_message.edit_text("Usage: /delete <id>")
+            return
+
+        try:
+            rid = int(context.args[0])
+        except ValueError:
+            await status_message.edit_text("Please provide a numeric receipt id.")
+            return
+
+        rows = execute_turso_sql(
+            "SELECT id, merchant, date, amount FROM receipts WHERE id = ?1;",
+            [rid],
+        ).rows
+
+        if not rows:
+            await status_message.edit_text(f"ℹ️ No receipt found with id={rid}.")
+            return
+
+        receipt_id, merchant, date_str, amount = rows[0]
+        execute_turso_sql("DELETE FROM receipts WHERE id = ?1;", [receipt_id])
+        sheets_removed = remove_receipt_row(int(receipt_id))
+        sheets_note = "\n📊 Also removed from Google Sheets." if sheets_removed else ""
+
+        reply = (
+            "🗑️ **Receipt Deleted!**\n\n"
+            f"**Merchant:** {merchant}\n"
+            f"**Date:** {date_str}\n"
+            f"**Amount:** ${float(amount):.2f}"
+            f"{sheets_note}"
+        )
+        await status_message.edit_text(reply, parse_mode="Markdown")
+
+    except Exception as e:
+        logging.error(f"Delete error: {e}")
+        await status_message.edit_text(f"❌ Failed to delete receipt: {str(e)}")
+
 async def clear_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Deletes all receipt records from the cloud database."""
     status_message = await update.message.reply_text("🧹 Clearing database...")
@@ -907,13 +949,14 @@ def main():
     app.add_handler(CommandHandler("undo", undo_last_command))
     app.add_handler(CommandHandler("cleardb", clear_db_command))
     app.add_handler(CommandHandler("dump", dump_db_command))
+    app.add_handler(CommandHandler("delete", delete_receipt_command))
 
     # Message handlers
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_query))
 
-    print("🤖 Bot is live with /undo, /cleardb, and /dump!")
+    print("🤖 Bot is live with /undo, /cleardb, /dump, and /delete <id>!")
     app.run_polling()
 
 if __name__ == "__main__":
