@@ -6,6 +6,7 @@ import logging
 import asyncio
 import time
 import requests
+import traceback
 from calendar import monthrange
 from datetime import datetime
 from threading import Thread
@@ -18,63 +19,63 @@ from PIL import Image
 from dataclasses import dataclass
 
 from urllib.parse import urlparse
+        try:
+            pdf_part = {"mime_type": "application/pdf", "data": bytes(pdf_bytes)}
+            prompt = f"""
+            You are a tax assistant reading an Uber / Uber Eats weekly summary PDF.
+            Extract payout figures and return STRICT JSON only (no markdown):
+            {
+              "date": "YYYY-MM-DD",
+              "gross_earnings": 0.00,
+              "uber_fees": 0.00,
+              "net_payout": 0.00,
+              "tips": 0.00,
+              "source": "Uber Eats"
+            }
+            Rules:
+            - date: week end date or statement date if available, else '{today_str}'
+            - gross_earnings: total gross / Your Earnings (number only)
+            - uber_fees: service/Uber fees if listed, else 0
+            - net_payout: amount paid out / net if listed; else gross_earnings - uber_fees
+            - tips: tips if listed, else 0
+            - source: "Uber Eats" unless clearly Uber trips only, then "Uber"
+            """
 
-from upload import export_receipt_row, remove_receipt_row, clear_receipt_export, export_uber_summary
-from upload import google_sheets
-from upload.google_drive_auth import (
-    drive_upload_configured,
-    oauth_partially_configured,
-    using_delegated_for_drive,
-    using_oauth_for_drive,
-)
+            response = await gemini_generate_content([prompt, pdf_part])
+            clean_text = re.sub(r'```json|```', '', response.text).strip()
+            data = json.loads(clean_text)
 
-# --- ENVIRONMENT & CONFIGURATION ---
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+            date_str = str(data.get("date", today_str))
+            gross_earnings = float(data.get("gross_earnings", 0.0) or 0.0)
+            uber_fees = float(data.get("uber_fees", 0.0) or 0.0)
+            net_payout = float(data.get("net_payout", 0.0) or 0.0)
+            tips = float(data.get("tips", 0.0) or 0.0)
+            source = str(data.get("source") or "Uber Eats")
 
+            if net_payout <= 0 and gross_earnings > 0:
+                net_payout = max(gross_earnings - uber_fees, 0.0)
 
-def normalize_turso_url(raw: str) -> str:
-    """Turn Turso libsql/https URLs into the base HTTPS origin for the HTTP API."""
-    url = raw.strip().strip("'\"")
-    if url.startswith("libsql://"):
-        url = "https://" + url[len("libsql://") :]
-    elif url and not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    return url.rstrip("/").split("/v2/")[0]
+            tax_set_aside = gross_earnings * 0.32
 
+            earnings_id = save_earnings_to_db(
+                date_str=date_str,
+                gross_earnings=gross_earnings,
+                uber_fees=uber_fees,
+                net_payout=net_payout,
+                tips=tips,
+                source=source,
+            )
 
-# Ensure URL starts with https:// for Turso HTTP API
-TURSO_URL = normalize_turso_url(os.getenv("TURSO_DATABASE_URL", ""))
-TURSO_TOKEN = (os.getenv("TURSO_AUTH_TOKEN") or "").strip().strip("'\"")
-
-# Configure Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
-model = genai.GenerativeModel(GEMINI_MODEL)
-
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-
-
-def _gemini_error_message(exc: Exception) -> str | None:
-    """User-facing message for common Gemini API failures, or None to use generic handling."""
-    text = str(exc)
-    lower = text.lower()
-    if "404" in text and ("no longer available" in lower or "not found" in lower or "models/" in lower):
-        return (
-            "❌ **Gemini model not available** for your API key.\n\n"
-            f"Current `GEMINI_MODEL`: `{GEMINI_MODEL}`.\n"
-            "Set `GEMINI_MODEL` in `.env` to a model your project supports "
-            "(e.g. `gemini-3.5-flash`, `gemini-1.5-flash`), then restart the bot."
-        )
-    if "429" in text or "quota" in lower or "rate" in lower:
-        if re.search(r"limit:\s*0\b", text) or "perday" in lower.replace("_", ""):
-            return (
-                "⏳ **Gemini free-tier quota is used up** for "
-                f"`{GEMINI_MODEL}` (daily/minute limit reached).\n\n"
-                "Retries cannot fix this until quota resets or you upgrade. "
-                "Enable billing in [Google AI Studio](https://aistudio.google.com/), "
-                "wait for the daily reset, or set `GEMINI_MODEL` to another model with quota."
+            summary_text = (
+                "📊 **Uber Weekly Summary**\n"
+                f"**Date:** {date_str}\n"
+                f"**Gross Earnings:** ${gross_earnings:.2f}\n"
+                f"**Uber Fees:** ${uber_fees:.2f}\n"
+                f"**Tips:** ${tips:.2f}\n"
+                f"**Net Payout:** ${net_payout:.2f}\n"
+                f"**Tax to Set Aside (32%):** ${tax_set_aside:.2f}\n"
+                f"**Source:** {source}"
+            )
             )
         return (
             "⏳ **Gemini rate limit (429).** The bot will retry automatically when possible. "
@@ -334,38 +335,77 @@ def save_earnings_to_db(
     source: str = "Uber Eats",
 ) -> int | None:
     """Insert an Uber earnings row and return its id after commit + read-back."""
-    sql = (
-        "INSERT INTO earnings (date, gross_earnings, uber_fees, net_payout, tips, source) "
-        "VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-    )
-    result = execute_turso_sql(
-        sql,
-        [
-            str(date_str),
-            float(gross_earnings),
-            float(uber_fees),
-            float(net_payout),
-            float(tips),
-            str(source),
-        ],
-    )
-    earnings_id = result.last_insert_rowid
-    if earnings_id is None:
-        logging.error(
-            "Turso earnings INSERT returned no id for date=%s gross=%s",
-            date_str,
-            gross_earnings,
+    try:
+        sql = (
+            "INSERT INTO earnings (date, gross_earnings, uber_fees, net_payout, tips, source) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
         )
-        return None
+        result = execute_turso_sql(
+            sql,
+            [
+                str(date_str),
+                float(gross_earnings),
+                float(uber_fees),
+                float(net_payout),
+                float(tips),
+                str(source),
+            ],
+        )
+        earnings_id = result.last_insert_rowid
+        if earnings_id is None:
+            logging.error(
+                "Turso earnings INSERT returned no id for date=%s gross=%s",
+                date_str,
+                gross_earnings,
+            )
+            return None
 
-    verify = execute_turso_sql(
-        "SELECT id FROM earnings WHERE id = ?1;",
-        [earnings_id],
-    )
-    if not verify.rows:
-        logging.error("Turso earnings INSERT for id=%s was not visible on read-back", earnings_id)
-        return None
-    return earnings_id
+        verify = execute_turso_sql(
+            "SELECT id FROM earnings WHERE id = ?1;",
+            [earnings_id],
+        )
+        if not verify.rows:
+            logging.error("Turso earnings INSERT for id=%s was not visible on read-back", earnings_id)
+            return None
+        return earnings_id
+    except Exception as exc:
+        trace = traceback.format_exc()
+        logging.error("Turso INSERT (earnings) exception: %s", trace)
+        # Write trace + payload to local queue file
+        try:
+            payload = {
+                "function": "save_earnings_to_db",
+                "args": {
+                    "date_str": date_str,
+                    "gross_earnings": gross_earnings,
+                    "uber_fees": uber_fees,
+                    "net_payout": net_payout,
+                    "tips": tips,
+                    "source": source,
+                },
+            }
+            with open("root_agent_queue.log", "a", encoding="utf-8") as fh:
+                fh.write(f"{datetime.utcnow().isoformat()} ERROR save_earnings_to_db\n")
+                fh.write(trace + "\n")
+                fh.write(json.dumps(payload, default=str) + "\n\n")
+        except Exception:
+            logging.error("Failed to write root_agent_queue.log for earnings exception")
+        # Attempt to notify bot owner if configured
+        owner_chat = os.getenv("TELEGRAM_OWNER_CHAT_ID")
+        if owner_chat and TELEGRAM_TOKEN:
+            try:
+                msg = (
+                    "⚠️ Error processing document! Stack trace logged. Dispatching Root Agent fix request...\n"
+                    + str(exc)
+                )
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                    json={"chat_id": owner_chat, "text": msg},
+                    timeout=10,
+                )
+            except Exception:
+                logging.warning("Failed to notify owner via Telegram for earnings exception")
+        raise
 
 
 def save_receipt_to_db(
@@ -376,41 +416,78 @@ def save_receipt_to_db(
     category: str | None = None,
 ) -> int | None:
     """Insert a receipt and return its id only after the write has completed."""
-    sql = (
-        "INSERT INTO receipts (merchant, date, amount, item, category) "
-        "VALUES (?1, ?2, ?3, ?4, ?5)"
-    )
-    # Text columns must always be strings (Gemini may return bare ints for dates/days).
-    text_or_none = lambda v: None if v is None else str(v)
-    result = execute_turso_sql(
-        sql,
-        [
-            str(merchant),
-            str(date_str),
-            float(amount),
-            text_or_none(item),
-            text_or_none(category),
-        ],
-    )
-    receipt_id = result.last_insert_rowid
-    if receipt_id is None:
-        logging.error(
-            "Turso INSERT returned no last_insert_rowid for merchant=%s date=%s amount=%s",
-            merchant,
-            date_str,
-            amount,
+    try:
+        sql = (
+            "INSERT INTO receipts (merchant, date, amount, item, category) "
+            "VALUES (?1, ?2, ?3, ?4, ?5)"
         )
-        return None
+        # Text columns must always be strings (Gemini may return bare ints for dates/days).
+        text_or_none = lambda v: None if v is None else str(v)
+        result = execute_turso_sql(
+            sql,
+            [
+                str(merchant),
+                str(date_str),
+                float(amount),
+                text_or_none(item),
+                text_or_none(category),
+            ],
+        )
+        receipt_id = result.last_insert_rowid
+        if receipt_id is None:
+            logging.error(
+                "Turso INSERT returned no last_insert_rowid for merchant=%s date=%s amount=%s",
+                merchant,
+                date_str,
+                amount,
+            )
+            return None
 
-    # Confirm the row is readable before callers reply to the user.
-    verify = execute_turso_sql(
-        "SELECT id FROM receipts WHERE id = ?1;",
-        [receipt_id],
-    )
-    if not verify.rows:
-        logging.error("Turso INSERT for id=%s was not visible on read-back", receipt_id)
-        return None
-    return receipt_id
+        # Confirm the row is readable before callers reply to the user.
+        verify = execute_turso_sql(
+            "SELECT id FROM receipts WHERE id = ?1;",
+            [receipt_id],
+        )
+        if not verify.rows:
+            logging.error("Turso INSERT for id=%s was not visible on read-back", receipt_id)
+            return None
+        return receipt_id
+    except Exception as exc:
+        trace = traceback.format_exc()
+        logging.error("Turso INSERT (receipts) exception: %s", trace)
+        try:
+            payload = {
+                "function": "save_receipt_to_db",
+                "args": {
+                    "merchant": merchant,
+                    "date_str": date_str,
+                    "amount": amount,
+                    "item": item,
+                    "category": category,
+                },
+            }
+            with open("root_agent_queue.log", "a", encoding="utf-8") as fh:
+                fh.write(f"{datetime.utcnow().isoformat()} ERROR save_receipt_to_db\n")
+                fh.write(trace + "\n")
+                fh.write(json.dumps(payload, default=str) + "\n\n")
+        except Exception:
+            logging.error("Failed to write root_agent_queue.log for receipts exception")
+
+        owner_chat = os.getenv("TELEGRAM_OWNER_CHAT_ID")
+        if owner_chat and TELEGRAM_TOKEN:
+            try:
+                msg = (
+                    "⚠️ Error processing document! Stack trace logged. Dispatching Root Agent fix request...\n"
+                    + str(exc)
+                )
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                    json={"chat_id": owner_chat, "text": msg},
+                    timeout=10,
+                )
+            except Exception:
+                logging.warning("Failed to notify owner via Telegram for receipts exception")
+        raise
 
 def query_db(sql_query: str):
     try:
@@ -547,85 +624,122 @@ async def dump_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- TELEGRAM MESSAGE HANDLERS ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_message = await update.message.reply_text("🔍 Analyzing receipt...")
-
     try:
         today_str = datetime.now().strftime("%Y-%m-%d")
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         image = Image.open(io.BytesIO(photo_bytes))
 
-        prompt = f"""
-        Analyze this image.
-        Step 1: Check if it is a purchase receipt/invoice.
-        Step 2: If NOT a receipt, return ONLY JSON: {{"is_receipt": false}}
-        Step 3: If it IS a receipt, extract:
-          - merchant
-          - date as YYYY-MM-DD (or '{today_str}' if missing/unclear)
-          - total paid amount (number only, e.g. 45.50)
-          - item: brief item/description if clear (e.g. "Diesel", "Unleaded 91"), else null
-          - category: one of fuel, food, parking, tolls, maintenance, other (lowercase), else null
-        Return output STRICTLY as valid JSON with no markdown tags:
-        {{"is_receipt": true, "merchant": "Store Name", "date": "YYYY-MM-DD", "amount": 45.50, "item": "Diesel", "category": "fuel"}}
-        """
+        try:
+            prompt = f"""
+            Analyze this image.
+            Step 1: Check if it is a purchase receipt/invoice.
+            Step 2: If NOT a receipt, return ONLY JSON: {{"is_receipt": false}}
+            Step 3: If it IS a receipt, extract:
+              - merchant
+              - date as YYYY-MM-DD (or '{today_str}' if missing/unclear)
+              - total paid amount (number only, e.g. 45.50)
+              - item: brief item/description if clear (e.g. "Diesel", "Unleaded 91"), else null
+              - category: one of fuel, food, parking, tolls, maintenance, other (lowercase), else null
+            Return output STRICTLY as valid JSON with no markdown tags:
+            {{"is_receipt": true, "merchant": "Store Name", "date": "YYYY-MM-DD", "amount": 45.50, "item": "Diesel", "category": "fuel"}}
+            """
 
-        response = await gemini_generate_content([prompt, image])
-        clean_text = re.sub(r'```json|```', '', response.text).strip()
-        data = json.loads(clean_text)
+            response = await gemini_generate_content([prompt, image])
+            clean_text = re.sub(r'```json|```', '', response.text).strip()
+            data = json.loads(clean_text)
 
-        if not data.get("is_receipt"):
-            await status_message.edit_text("⚠️ This photo does not appear to be a receipt. Please upload a clear receipt image.")
-            return
+            if not data.get("is_receipt"):
+                await status_message.edit_text("⚠️ This photo does not appear to be a receipt. Please upload a clear receipt image.")
+                return
 
-        merchant = str(data.get("merchant", "Unknown"))
-        date_str = str(data.get("date", today_str))
-        amount = float(data.get("amount", 0.0))
-        item = data.get("item") or None
-        category = data.get("category") or None
-        if item is not None:
-            item = str(item).strip() or None
-        if category is not None:
-            category = str(category).strip().lower() or None
+            merchant = str(data.get("merchant", "Unknown"))
+            date_str = str(data.get("date", today_str))
+            amount = float(data.get("amount", 0.0))
+            item = data.get("item") or None
+            category = data.get("category") or None
+            if item is not None:
+                item = str(item).strip() or None
+            if category is not None:
+                category = str(category).strip().lower() or None
 
-        if is_duplicate_receipt(merchant, date_str, amount):
-            header = (
-                "⚠️ **Duplicate Receipt Detected!** "
-                "(Match in Turso — not saved again; Google Sheets not updated.)\n\n"
-            )
-        else:
-            receipt_id = save_receipt_to_db(
-                merchant, date_str, amount, item=item, category=category
-            )
-            sheets_ok = False
-            if receipt_id is not None:
-                sheets_ok = export_receipt_row(
-                    receipt_id,
-                    merchant,
-                    date_str,
-                    amount,
-                    image_bytes=bytes(photo_bytes),
-                )
-            if sheets_ok:
-                header = "✅ **Receipt Saved** (Turso + Google Sheets)\n\n"
-            elif receipt_id is not None:
+            if is_duplicate_receipt(merchant, date_str, amount):
                 header = (
-                    "✅ **Receipt Saved to Cloud Database!** "
-                    "_(Google Sheets skipped duplicate or sync failed — check logs.)_\n\n"
+                    "⚠️ **Duplicate Receipt Detected!** "
+                    "(Match in Turso — not saved again; Google Sheets not updated.)\n\n"
                 )
             else:
-                header = "✅ **Receipt Saved to Cloud Database!**\n\n"
+                receipt_id = save_receipt_to_db(
+                    merchant, date_str, amount, item=item, category=category
+                )
+                sheets_ok = False
+                if receipt_id is not None:
+                    sheets_ok = export_receipt_row(
+                        receipt_id,
+                        merchant,
+                        date_str,
+                        amount,
+                        image_bytes=bytes(photo_bytes),
+                    )
+                if sheets_ok:
+                    header = "✅ **Receipt Saved** (Turso + Google Sheets)\n\n"
+                elif receipt_id is not None:
+                    header = (
+                        "✅ **Receipt Saved to Cloud Database!** "
+                        "_(Google Sheets skipped duplicate or sync failed — check logs.)?_\n\n"
+                    )
+                else:
+                    header = "✅ **Receipt Saved to Cloud Database!**\n\n"
 
-        reply = (
-            f"{header}"
-            f"**Merchant:** {merchant}\n"
-            f"**Date:** {date_str}\n"
-            f"**Total Paid:** ${amount:.2f}"
-        )
-        if item:
-            reply += f"\n**Item:** {item}"
-        if category:
-            reply += f"\n**Category:** {category}"
-        await status_message.edit_text(reply, parse_mode="Markdown")
+            reply = (
+                f"{header}"
+                f"**Merchant:** {merchant}\n"
+                f"**Date:** {date_str}\n"
+                f"**Total Paid:** ${amount:.2f}"
+            )
+            if item:
+                reply += f"\n**Item:** {item}"
+            if category:
+                reply += f"\n**Category:** {category}"
+            await status_message.edit_text(reply, parse_mode="Markdown")
 
+        except Exception as exc:
+            trace = traceback.format_exc()
+            logging.error("Receipt processing exception: %s", trace)
+            # Notify the user who uploaded
+            try:
+                await update.message.reply_text(
+                    "⚠️ Error processing document! Stack trace logged. Dispatching Root Agent fix request...\n" + str(exc)
+                )
+            except Exception:
+                logging.warning("Failed to reply to user after receipt exception")
+            # Write trace + payload to local queue file
+            try:
+                payload = {
+                    "handler": "handle_photo",
+                    "user": getattr(update.effective_user, 'id', None),
+                    "photo_file_id": getattr(photo_file, 'file_id', None),
+                    "photo_bytes_len": len(photo_bytes) if 'photo_bytes' in locals() else None,
+                }
+                with open("root_agent_queue.log", "a", encoding="utf-8") as fh:
+                    fh.write(f"{datetime.utcnow().isoformat()} ERROR handle_photo\n")
+                    fh.write(trace + "\n")
+                    fh.write(json.dumps(payload, default=str) + "\n\n")
+            except Exception:
+                logging.error("Failed to write root_agent_queue.log for handle_photo exception")
+
+            # Also attempt to notify bot owner if configured
+            owner_chat = os.getenv("TELEGRAM_OWNER_CHAT_ID")
+            if owner_chat and TELEGRAM_TOKEN:
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                        json={"chat_id": owner_chat, "text": "⚠️ Error processing document! Stack trace logged. Dispatching Root Agent fix request...\n" + str(exc)},
+                        timeout=10,
+                    )
+                except Exception:
+                    logging.warning("Failed to notify owner via Telegram for handle_photo exception")
+            return
     except Exception as e:
         logging.error(f"Receipt error: {e}")
         friendly = _gemini_error_message(e)
@@ -814,8 +928,51 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if export_uber_summary(summary_text):
             summary_text += "\n📊 _Copied to Google Sheets (Uber Summaries tab)._"
 
-        await status_message.edit_text(summary_text, parse_mode="Markdown")
+            if earnings_id is not None:
+                summary_text += f"\n\n💾 _Saved to Turso earnings (id={earnings_id})._"
+            else:
+                summary_text += "\n\n⚠️ _Could not save earnings row to Turso — check logs._"
 
+            if export_uber_summary(summary_text):
+                summary_text += "\n📊 _Copied to Google Sheets (Uber Summaries tab)._"
+
+            await status_message.edit_text(summary_text, parse_mode="Markdown")
+
+        except Exception as exc:
+            trace = traceback.format_exc()
+            logging.error("PDF processing exception: %s", trace)
+            try:
+                await update.message.reply_text(
+                    "⚠️ Error processing document! Stack trace logged. Dispatching Root Agent fix request...\n" + str(exc)
+                )
+            except Exception:
+                logging.warning("Failed to reply to user after PDF exception")
+
+            try:
+                payload = {
+                    "handler": "handle_document",
+                    "user": getattr(update.effective_user, 'id', None),
+                    "file_name": document.file_name,
+                    "pdf_bytes_len": len(pdf_bytes) if 'pdf_bytes' in locals() else None,
+                }
+                with open("root_agent_queue.log", "a", encoding="utf-8") as fh:
+                    fh.write(f"{datetime.utcnow().isoformat()} ERROR handle_document\n")
+                    fh.write(trace + "\n")
+                    fh.write(json.dumps(payload, default=str) + "\n\n")
+            except Exception:
+                logging.error("Failed to write root_agent_queue.log for handle_document exception")
+
+            owner_chat = os.getenv("TELEGRAM_OWNER_CHAT_ID")
+            if owner_chat and TELEGRAM_TOKEN:
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                        json={"chat_id": owner_chat, "text": "⚠️ Error processing document! Stack trace logged. Dispatching Root Agent fix request...\n" + str(exc)},
+                        timeout=10,
+                    )
+                except Exception:
+                    logging.warning("Failed to notify owner via Telegram for handle_document exception")
+            return
     except Exception as e:
         logging.error(f"PDF error: {e}")
         friendly = _gemini_error_message(e)
