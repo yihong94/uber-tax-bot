@@ -586,6 +586,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if category is not None:
             category = str(category).strip().lower() or None
 
+        # Only accept fuel receipts: either category labeled 'fuel' OR merchant/item match fuel keywords
+        fuel_keywords = (
+            "fuel,diesel,petrol,gas,unleaded,bp,shell,caltex,ampol,7-eleven,7eleven,service station,petrol station,coles express,woolworths petrol"
+        ).split(",")
+        low_text = " ".join([str(x or "") for x in (merchant, item)]).lower()
+        is_fuel = False
+        if category == "fuel":
+            is_fuel = True
+        else:
+            for kw in fuel_keywords:
+                if kw and kw in low_text:
+                    is_fuel = True
+                    break
+
+        if not is_fuel:
+            await status_message.edit_text(
+                "⚠️ Only fuel receipts are accepted. This receipt appears to be non-fuel and will not be saved."
+            )
+            return
+
         if is_duplicate_receipt(merchant, date_str, amount):
             header = (
                 "⚠️ **Duplicate Receipt Detected!** "
